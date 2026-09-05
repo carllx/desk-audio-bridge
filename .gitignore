@@ -1,0 +1,60 @@
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Audio recordings & unbounded media files
+# (Ban actual recordings and unbounded growth files; keep repo lean)
+*.wav
+*.aiff
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.aac
+recordings/
+
+# Logs & caches
+logs/
+*.log
+caches/
+.cache/
+tmp/
+temp/
+
+# Performance traces & profiling dumps
+*.dump
+*.pcap
+*.perf
+*.trace
+
+# Local configurations & secrets
+*.local
+*.local.*
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.yaml
+*.local.toml
+
+# Installers & binary packages
+*.exe
+*.msi
+*.dmg
+*.pkg
+*.zip
+*.tar.gz
+*.iso
+
+# IDE & Editor caches
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
