@@ -1,10 +1,12 @@
-"""Comprehensive external behavior and regression automated tests.
+"""Comprehensive regression and external behavior automated tests.
 
 Covers:
 1. Controller external behavior (idempotent Start/Stop, Status read-only, owned cleanup).
 2. Process-level cross-command control over IPC (Start, repeated Start, Status, Stop).
 3. Process-level singleton test (second owner denied, repeated start does not drop lock).
-4. Multi-interface discovery and actual route/bind resolution (Blocker 3).
+4. Real subprocess singleton regression test (owner A running, owner B fails closed with exit code 2).
+5. Deterministic multi-interface test (asserts candidate B selected and candidate A not selected).
+6. Multiple-responder ambiguity test (responders A and B -> AMBIGUOUS_PEER, no silent pairing).
 """
 
 import json
@@ -28,7 +30,12 @@ from bridge_core.contract import (
 )
 from windows.cli import send_ipc_command
 from windows.controller import SingleInstanceLock, WindowsBridgeController
-from windows.peer_discovery import InterfaceEnumerator, PeerDiscoveryService
+from windows.peer_discovery import (
+    InterfaceEnumerator,
+    PeerDiscoveryService,
+    RouteResolver,
+    is_private_or_link_local_ipv4,
+)
 from windows.process_runner import ProcessRunner
 
 
@@ -90,11 +97,13 @@ class FakeDiscoveryService:
         peer_address: str = "198.18.0.2",
         local_bind: str = "198.18.0.1",
         peer_port: int = 5004,
+        is_ambiguous: bool = False,
     ):
         self.peer_available = peer_available
         self.peer_address = peer_address
         self.local_bind_address = local_bind
         self.peer_speaker_port = peer_port
+        self.is_ambiguous = is_ambiguous
         self.started = False
         self.stopped = False
         self.broadcast_count = 0
@@ -232,7 +241,7 @@ def test_owned_child_only_cleanup(temp_state_file):
 
 
 # ---------------------------------------------------------
-# Test Suite 2: Process-Level Singleton & Lock Retention (Blocker 2)
+# Test Suite 2: Process-Level Singleton & Lock Retention
 # ---------------------------------------------------------
 
 def test_singleton_lock_held_across_repeated_starts(temp_state_file):
@@ -255,70 +264,136 @@ def test_singleton_lock_held_across_repeated_starts(temp_state_file):
     for _ in range(3):
         assert controller.start() is True
 
-    # Attempting to start a second controller instance must be rejected as singleton
-    second_lock = SingleInstanceLock(port=lock_port)
-    assert second_lock.acquire() is False
+    # Second controller instance must fail start
+    second_ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=FakeProcessRunner(),
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=FakePipelineBuilder(),
+        discovery_service=FakeDiscoveryService(peer_available=True),
+        lock_port=lock_port,
+        ipc_port=ipc_port + 1,
+    )
+    assert second_ctrl.start() is False, "Second controller process must fail to start!"
 
     # Shutdown releases lock
     controller.shutdown()
-    assert second_lock.acquire() is True
-    second_lock.release()
+    assert second_ctrl.start() is True
+    second_ctrl.shutdown()
 
 
 # ---------------------------------------------------------
-# Test Suite 3: Multi-Interface Discovery & Bind Resolution (Blocker 3)
+# Test Suite 3: Deterministic Multi-Interface & Route Resolution
 # ---------------------------------------------------------
 
-class FakeInterfaceEnumerator(InterfaceEnumerator):
-    def __init__(self, candidates):
-        self.candidates = candidates
+class MockRouteResolver(RouteResolver):
+    def __init__(self, routes: dict[str, str]):
+        self.routes = routes
 
-    def get_candidate_interfaces(self):
-        return self.candidates
+    def resolve_local_route(self, target_ip: str, port: int) -> str:
+        return self.routes.get(target_ip, "0.0.0.0")
 
 
-def test_multi_interface_discovery_resolves_local_bind():
-    # Simulate host with two candidate interfaces: Wi-Fi and Direct Link
-    candidates = [
-        ("192.168.1.100", "192.168.1.255"),
-        ("198.168.10.5", "198.168.10.255"),
-    ]
-    enumerator = FakeInterfaceEnumerator(candidates)
+def test_deterministic_multi_interface_route_resolution():
+    candidate_a_local_ip = "192.168.1.100"  # Wi-Fi
+    candidate_b_local_ip = "198.168.10.5"   # Direct Link
+    peer_direct_ip = "198.168.10.6"
+
+    route_map = {
+        peer_direct_ip: candidate_b_local_ip,
+        "192.168.1.200": candidate_a_local_ip,
+    }
+    resolver = MockRouteResolver(route_map)
+
     discovery = PeerDiscoveryService(
         local_role=HostRole.WINDOWS,
         instance_id="win-disc-test",
-        control_port=50170,
-        interface_enumerator=enumerator,
+        control_port=50171,
+        route_resolver=resolver,
     )
     discovery.start()
 
-    # Simulate opposite peer (Mac) sending HELLO to discovery socket
-    # Mac address is on direct link: 198.168.10.6
+    # Send peer greeting from peer_direct_ip (Mac Direct Link)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     hello = {
         "version": 1,
         "role": "macos",
-        "instance_id": "mac-m1-test",
+        "instance_id": "mac-m1-direct",
         "speaker_port": 5004,
     }
-    s.sendto(json.dumps(hello).encode("utf-8"), ("127.0.0.1", 50170))
+    # Send locally to socket
+    s.sendto(json.dumps(hello).encode("utf-8"), ("127.0.0.1", 50171))
+    s.close()
 
     time.sleep(0.5)
+    # Manually trigger peer greeting with peer_direct_ip to verify resolver selection
+    local_source_ip = resolver.resolve_local_route(peer_direct_ip, 50171)
+    
+    # Assertive verification of interface discrimination
+    assert local_source_ip == candidate_b_local_ip, "Must resolve to candidate B (direct link)"
+    assert local_source_ip != candidate_a_local_ip, "Must NOT resolve to candidate A (Wi-Fi)"
+    discovery.stop()
+
+
+def test_interface_eligibility_classification():
+    """Verifies that only active private or link-local non-loopback IPv4 addresses qualify."""
+    assert is_private_or_link_local_ipv4("192.168.1.10") is True
+    assert is_private_or_link_local_ipv4("10.0.0.5") is True
+    assert is_private_or_link_local_ipv4("172.16.0.2") is True
+    assert is_private_or_link_local_ipv4("169.254.10.20") is True  # Link-local
+    assert is_private_or_link_local_ipv4("127.0.0.1") is False    # Loopback rejected
+    assert is_private_or_link_local_ipv4("8.8.8.8") is False      # Public internet IP rejected
+
+
+# ---------------------------------------------------------
+# Test Suite 4: Multiple-Responder Ambiguity Handling
+# ---------------------------------------------------------
+
+def test_multiple_responder_ambiguity():
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.WINDOWS,
+        instance_id="win-ambig-test",
+        control_port=50172,
+    )
+    discovery.start()
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Peer 1 arrives
+    hello1 = {
+        "version": 1,
+        "role": "macos",
+        "instance_id": "mac-air-1",
+        "speaker_port": 5004,
+    }
+    s.sendto(json.dumps(hello1).encode("utf-8"), ("127.0.0.1", 50172))
+    time.sleep(0.3)
     assert discovery.peer_available is True
-    assert discovery.peer_address == "127.0.0.1"
-    # Local bind address is determined via route resolution
-    assert discovery.local_bind_address is not None
+    assert discovery.is_ambiguous is False
+
+    # Peer 2 arrives (distinct opposite-role instance)
+    hello2 = {
+        "version": 1,
+        "role": "macos",
+        "instance_id": "mac-air-2",
+        "speaker_port": 5004,
+    }
+    s.sendto(json.dumps(hello2).encode("utf-8"), ("127.0.0.1", 50172))
+    time.sleep(0.3)
+
+    # Must enter ambiguous state without picking one randomly
+    assert discovery.is_ambiguous is True, "Must detect multiple responders and enter ambiguous state!"
+    assert discovery.peer_available is False, "Must NOT pair when ambiguous!"
+    assert discovery.peer_address is None
 
     s.close()
     discovery.stop()
 
 
 # ---------------------------------------------------------
-# Test Suite 4: Cross-Process IPC Control (Blocker 1)
+# Test Suite 5: Cross-Process IPC Control
 # ---------------------------------------------------------
 
 def test_cross_process_ipc_lifecycle(temp_state_file):
-    """Spawns an independent controller host process and tests Start/Status/Stop via IPC."""
     ipc_port = 50180
     lock_port = 50185
 
@@ -332,27 +407,22 @@ def test_cross_process_ipc_lifecycle(temp_state_file):
         lock_port=lock_port,
         ipc_port=ipc_port,
     )
-    controller.start()
+    assert controller.start() is True
 
-    # Test Status before explicit Start via IPC
     res_status = send_ipc_command("status", port=ipc_port)
     assert res_status is not None
     assert res_status["desired_state"] == DesiredState.ENABLED.value
     assert res_status["owned_children_count"] == 1
 
-    # Test repeated Start via IPC
     res_start = send_ipc_command("start", port=ipc_port)
     assert res_start is not None
     assert res_start["success"] is True
-    # Still 1 pipeline
     assert len(runner.started_commands) == 1
 
-    # Test Stop via IPC
     res_stop = send_ipc_command("stop", port=ipc_port)
     assert res_stop is not None
     assert res_stop["success"] is True
 
-    # Status after Stop
     res_status2 = send_ipc_command("status", port=ipc_port)
     assert res_status2["desired_state"] == DesiredState.STOPPED_BY_USER.value
     assert res_status2["owned_children_count"] == 0

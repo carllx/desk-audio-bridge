@@ -41,7 +41,6 @@ def ensure_controller_host_running(port: int = DEFAULT_LOCAL_IPC_PORT) -> bool:
     if res is not None:
         return True
 
-    # Spawn background daemon process
     python_exe = sys.executable
     cmd = [python_exe, "-m", "windows.cli", "run"]
     subprocess.Popen(
@@ -50,7 +49,6 @@ def ensure_controller_host_running(port: int = DEFAULT_LOCAL_IPC_PORT) -> bool:
         stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
     )
-    # Wait for IPC to become responsive
     start_time = time.time()
     while time.time() - start_time < 3.0:
         time.sleep(0.1)
@@ -60,11 +58,14 @@ def ensure_controller_host_running(port: int = DEFAULT_LOCAL_IPC_PORT) -> bool:
 
 
 def run_host_service():
-    """Runs the controller owner process in foreground/daemon mode."""
+    """Runs the controller owner process in foreground/daemon mode.
+    
+    Fails closed with exit code 2 if another process holds the singleton lock.
+    """
     controller = WindowsBridgeController()
     if not controller.start():
-        print("Failed to start controller host: singleton already active")
-        sys.exit(1)
+        print("Failed to start controller host: singleton lock held by another process", file=sys.stderr)
+        sys.exit(2)
 
     print(f"Controller host started (PID {os.getpid()})")
     try:
@@ -96,20 +97,20 @@ def main():
     # For Start: Ensure controller host is running, then send start command
     if args.command == "start":
         if not ensure_controller_host_running():
-            print("Failed to start or connect to controller host")
+            print("Failed to start or connect to controller host", file=sys.stderr)
             sys.exit(1)
         res = send_ipc_command("start")
         if res and res.get("success"):
             print("Controller enabled")
         else:
-            print(f"Failed to enable controller: {res}")
+            print(f"Failed to enable controller: {res}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "stop":
         res = send_ipc_command("stop")
         if res is not None:
             print("Controller stopped (STOPPED_BY_USER)")
         else:
-            # If no host is running, persist STOPPED_BY_USER state directly
             ctrl = WindowsBridgeController()
             ctrl.stop()
             print("Controller stopped (no host running, persisted STOPPED_BY_USER)")
@@ -126,7 +127,6 @@ def main():
         if res is not None:
             status_dict = res
         else:
-            # Fallback to local read-only status from disk state
             ctrl = WindowsBridgeController()
             status_dict = ctrl.get_status().to_dict()
             status_dict["controller_state"] = "STOPPED (HOST_NOT_RUNNING)"

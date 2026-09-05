@@ -216,14 +216,16 @@ class WindowsBridgeController:
             logger.warning("Could not persist desired state: %s", exc)
 
     def start(self) -> bool:
-        """Idempotently enables the controller and triggers reconcile."""
+        """Enables the controller and triggers reconcile.
+        
+        Returns True if this instance successfully holds or already holds the singleton lock.
+        Returns False if another process holds the singleton lock.
+        """
         with self._lock:
             if not self._singleton_lock.is_held:
                 if not self._singleton_lock.acquire():
-                    logger.info("Controller singleton already active on host")
-                    self._desired_state = DesiredState.ENABLED
-                    self._persist_desired_state(DesiredState.ENABLED)
-                    return True
+                    logger.warning("Controller start rejected: another process holds the singleton lock")
+                    return False
 
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
@@ -290,7 +292,7 @@ class WindowsBridgeController:
                 speaker_target_port=self.discovery_service.peer_speaker_port,
                 last_actionable_error=self._last_actionable_error,
                 owned_children_count=owned_count,
-                owner_pid=os.getpid(),
+                owner_pid=os.getpid() if self._singleton_lock.is_held else None,
             )
 
     def reconcile(self) -> None:
@@ -302,6 +304,16 @@ class WindowsBridgeController:
                     self._speaker_child_pid = None
                 self._speaker_path_state = PathState.STOPPED
                 self._controller_state = LifecycleState.STOPPED
+                return
+
+            # Check ambiguity state
+            if getattr(self.discovery_service, "is_ambiguous", False):
+                self._last_actionable_error = "Multiple opposite-role responders discovered; manual peer selection required"
+                self._controller_state = LifecycleState.AMBIGUOUS_PEER
+                if self._speaker_child_pid is not None:
+                    self.process_runner.stop_process(self._speaker_child_pid)
+                    self._speaker_child_pid = None
+                    self._speaker_path_state = PathState.IDLE
                 return
 
             # Desired state is ENABLED

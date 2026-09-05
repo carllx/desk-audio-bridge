@@ -40,6 +40,7 @@ class LifecycleState(str, Enum):
     DISCOVERING = "DISCOVERING"
     READY = "READY"
     ACTIVE = "ACTIVE"
+    AMBIGUOUS_PEER = "AMBIGUOUS_PEER"
     ERROR = "ERROR"
 
 
