@@ -53,6 +53,7 @@ desk-audio-bridge/
 
 ## 双机协作守则 (Dual-Machine Collaboration)
 
-* **权威代码库**：`carllx/desk-audio-bridge`。
-* **分工协作**：两台机器各自建立独立本地 workspace，禁止两端 IDE Agent 并发直推 `main` 分支。
-* **状态同步**：通过独立 Branch、GitHub Issue / PR 与 Git Commit 同步状态，代码与文档为跨机唯一真理来源。
+* **权威代码库**：`carllx/desk-audio-bridge`，以 GitHub `origin/main` 为唯一合并基线。
+* **分工协作**：两台机器各自建立独立本地 workspace，严禁两端 IDE 并发直推 `main` 分支。
+* **分支与同步**：以独立 Feature Branch 和 GitHub PR 为汇聚机制，共享文件需指定单 Owner。
+* **详细规范**：详见权威协作规范文档 [docs/agents/dual-machine-collaboration.md](docs/agents/dual-machine-collaboration.md)。

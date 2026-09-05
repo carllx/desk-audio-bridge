@@ -94,12 +94,19 @@
 
 ## 6. 双机协作规范 (Dual-Machine Collaboration Rules)
 
-1. **统一远端仓库**：`https://github.com/carllx/desk-audio-bridge`，默认分支 `main`。
-2. **独立本地工作区**：两台物理机器各维护独立 clone。
-3. **禁止并发直推 main**：实质实现应使用独立 Feature Branch + Issue；共享文件修改必须协调。
-4. **目录职责**：`macos/**`、`windows/**` 为平台专属；`docs/**`、`README.md`、`CONTEXT.md`、`AGENTS.md` 为共享状态。
-5. **跨机权威状态**：GitHub Issue / PR、远端 Commit、仓库权威文档是跨机 SSOT。口头 session 状态、后台 PID、自报“已启动”均不是长期事实。
-6. **Session 健康**：出现反复询问已知事实、重复旧结论、忽略 Human Gate、把局部 metric 当端到端 PASS 等退化信号时，在 Work Unit/阶段边界切 Fresh IDE session。
+跨机器协作与 Git 同步冲突防护规则（详细规范与 SOP 详见 `docs/agents/dual-machine-collaboration.md`，权威依据 Issue #9）：
+
+1. **统一远端仓库与唯一基线**：项目唯一远端 `https://github.com/carllx/desk-audio-bridge`，`origin/main` 为两机唯一合并基线。本地后台进程、未推送分支和口头状态不构成跨机 SSOT。
+2. **独立本地工作区与禁止网盘同步**：两台物理机器各维护独立 clone，禁止共享同一文件系统工作区，严禁引入网盘/Dropbox/rsync 等双向目录同步替代 Git。
+3. **独立 Feature Branch**：每个独立 Work Unit 从最新 `origin/main` 检出独立 feature branch，禁止在旧基线上直接开发。
+4. **开工标准同步协议**：开工前统一执行 `git fetch origin` → `git switch main` → `git pull --ff-only origin main` → 创建/切换工作分支。
+5. **平台专属目录职责**：`windows/**` 优先且仅归属 Windows 端；`macos/**` 优先且仅归属 macOS 端。
+6. **共享文件单 Owner 机制**：`CONTEXT.md`、`README.md`、`docs/**`、`AGENTS.md` 属于共享文件，同一时刻只能有一个明确 owner 修改，另一端保持只读或等待 merge。
+7. **禁止并发直推 main**：两端 IDE 严禁并发直接 push `main`。实现通过 feature branch + fixed pushed commit SHA / PR 汇聚后合并。
+8. **Merge 后强制对端重同步**：任一任务 merge 入 `main` 后，另一端继续工作前必须重新 `fetch` + `pull --ff-only`，不得基于旧基线继续。
+9. **Local-only State 保护**：若发现本地已有未提交/未推送修改，必须先报告 `Local-only state`，严禁直接 pull/rebase/reset 覆盖。
+10. **运行时配置隔离**：IP、endpoint GUID、设备 ID 等 runtime-only 配置保存在 ignored local config，真实值不入 Git。
+11. **Session 健康**：出现反复询问已知事实、重复旧结论、忽略 Human Gate、把局部 metric 当端到端 PASS 等退化信号时，在 Work Unit/阶段边界切 Fresh IDE session。
 
 ---
 

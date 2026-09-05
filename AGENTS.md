@@ -8,21 +8,24 @@
 
 ## 1. 仓库定位与双机协作体系 (Dual-Machine Collaboration)
 
-本项目旨在实现同一局域网内 Windows PC 使用 Mac 的内置扬声器与麦克风。本项目涉及跨平台双机开发，其协作架构与维护边界如下：
+本项目旨在实现同一局域网内 Windows PC 使用 Mac 的内置扬声器与麦克风。本项目涉及跨平台双机开发，其协作架构与维护边界如下（完整 SOP 详见 `docs/agents/dual-machine-collaboration.md`）：
 
 ### A. 存储与工作区架构
-* **单一权威代码库**：项目唯一远端为 `https://github.com/carllx/desk-audio-bridge`。
-* **独立工作区**：Windows PC 与 Mac 各自拥有独立的本地 Git workspace。
-* **禁止并发直推 main**：两台机器上的 IDE Agent **严禁**未经协调并发直接向 `main` 分支提交或推送代码。
-* **分支与工单驱动**：各机器在独立 Feature Branch / Issue 上开展工作，通过 GitHub PR / Merge 机制最终 Join。
+* **单一权威代码库**：项目唯一远端为 `https://github.com/carllx/desk-audio-bridge`，`origin/main` 为跨机唯一合并基线。
+* **独立工作区与禁止网盘同步**：Windows PC 与 Mac 各自拥有独立的本地 Git workspace clone，禁止共享同一文件系统工作区，严禁引入网盘/Dropbox/rsync 等双向目录同步替代 Git。
+* **开工标准流与分支隔离**：每个独立 Work Unit 从最新 `origin/main` 检出独立 feature branch。开工前统一执行：`fetch -> main -> pull --ff-only -> feature branch`。
+* **禁止并发直推 main**：两台机器上的 IDE Agent **严禁**并发直接向 `main` 分支 push 代码。所有变更必须通过 feature branch + 固定 pushed commit SHA / PR 汇聚后合并。
+* **对端 Merge 重同步**：任一分支 merge 入 `main` 后，另一台机器开工前必须重新 `fetch` + `pull --ff-only`，严禁基于过时基线工作。
+* **Local-only State 保护**：若发现本地已有未提交或未推送修改，先向用户报告 `Local-only state`，严禁直接 pull/rebase/reset 覆盖。
 * **跨机权威状态 (Canonical Cross-Machine State)**：GitHub Issue、PR、已推送 Commit 及 `docs/` 文档是跨机器唯一的权威状态（SSOT），绝不依赖 Agent 之间的口头转述或易失会话记忆。
 
-### B. 目录边界划分
+### B. 目录边界划分与共享文件所有权
 * **平台专属区域**：
   * `macos/**`：macOS 端专用逻辑、配置及脚本，由 Mac 侧会话主要负责。
   * `windows/**`：Windows 端专用逻辑、配置及脚本，由 Windows 侧会话主要负责。
-* **共享区域**：
-  * 根目录文档（`README.md`、`CONTEXT.md`、`AGENTS.md`）及 `docs/**` 属于两端共享状态，修改须慎重，避免未经对齐的并发冲突。
+* **共享区域与单一 Owner 机制**：
+  * 根目录文档（`README.md`、`CONTEXT.md`、`AGENTS.md`）及 `docs/**` 属于两端共享状态。
+  * **同一时间只能有一个明确指定的机器/会话作为 Owner 写入共享文件**；另一端保持只读或等待 merge，杜绝并发冲突。
 
 ---
 
@@ -55,7 +58,7 @@
 
 配置规范：
 * 配置模板纳入版本控制：`*.example` 或模板文件。
-* 真实本机配置文件统一忽略：`*.local` 或加入 `.gitignore`。
+* 真实本机配置文件统一忽略：`*.local` 或加入 `.gitignore`，绝不通过 Git 同步真实 runtime 配置值。
 
 ---
 
@@ -72,3 +75,7 @@ Default canonical label mapping. See `docs/agents/triage-labels.md`.
 ### Domain docs
 
 Single-context. See `docs/agents/domain.md`.
+
+### Dual-machine collaboration
+
+Git synchronization and conflict prevention rules across Windows and macOS clones. See `docs/agents/dual-machine-collaboration.md`.
