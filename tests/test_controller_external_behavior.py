@@ -447,7 +447,13 @@ def test_multiple_responder_ambiguity_and_recovery():
     discovery._known_responders["mac-air-2"] = ("198.168.10.7", now - 20.0)
     discovery._known_responders["mac-air-1"] = ("198.168.10.6", now)
 
-    # Calling is_ambiguous automatically prunes expired peers and recovers sole responder
+    # Pure getter inspection does NOT mutate or recover
+    assert discovery.is_ambiguous is True
+    assert discovery.peer_available is False
+    assert discovery.peer_address is None
+
+    # Calling explicit refresh_peer_state prunes expired peers and recovers sole responder
+    discovery.refresh_peer_state(now=now)
     assert discovery.is_ambiguous is False
     assert discovery.peer_available is True
     assert discovery.peer_address == "198.168.10.6"

@@ -240,6 +240,7 @@ class WindowsBridgeController:
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
             self._controller_state = LifecycleState.STARTING
+            self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
 
             # Start IPC server
@@ -314,6 +315,10 @@ class WindowsBridgeController:
     def reconcile(self) -> None:
         """Idempotently brings actual state toward desired state."""
         with self._lock:
+            # Explicitly advance discovery state, pruning expired responders and handling ambiguity recovery
+            if hasattr(self.discovery_service, "refresh_peer_state"):
+                self.discovery_service.refresh_peer_state()
+
             if self._desired_state == DesiredState.STOPPED_BY_USER:
                 if self._speaker_child_pid is not None:
                     self.process_runner.stop_process(self._speaker_child_pid)

@@ -188,19 +188,6 @@ class PeerDiscoveryService:
     @property
     def is_ambiguous(self) -> bool:
         with self._lock:
-            # First prune any responders expired > 15s to check recovery
-            now = time.time()
-            self._known_responders = {
-                k: v for k, v in self._known_responders.items() if (now - v[1]) < 15.0
-            }
-            if len(self._known_responders) <= 1 and self._is_ambiguous:
-                self._is_ambiguous = False
-                if len(self._known_responders) == 1:
-                    sole_inst, (sole_ip, sole_time) = next(iter(self._known_responders.items()))
-                    self._peer_instance_id = sole_inst
-                    self._peer_address = sole_ip
-                    self._local_bind_address = self.route_resolver.resolve_local_route(sole_ip, self.control_port)
-                    self._last_peer_seen = sole_time
             return self._is_ambiguous
 
     @property
@@ -211,14 +198,14 @@ class PeerDiscoveryService:
     @property
     def peer_address(self) -> Optional[str]:
         with self._lock:
-            if self.is_ambiguous:
+            if self._is_ambiguous:
                 return None
             return self._peer_address
 
     @property
     def local_bind_address(self) -> Optional[str]:
         with self._lock:
-            if self.is_ambiguous:
+            if self._is_ambiguous:
                 return None
             return self._local_bind_address
 
@@ -226,6 +213,41 @@ class PeerDiscoveryService:
     def peer_speaker_port(self) -> int:
         with self._lock:
             return self._peer_speaker_port
+
+    def refresh_peer_state(self, now: Optional[float] = None) -> None:
+        """Explicitly advances discovery state, prunes expired responders, and resolves ambiguity recovery.
+        
+        Must ONLY be called from mutating loops or reconciliation routines, NEVER from Status/getters.
+        """
+        with self._lock:
+            current_time = now if now is not None else time.time()
+            # 1. Prune responders expired > 15s
+            self._known_responders = {
+                k: v for k, v in self._known_responders.items() if (current_time - v[1]) < 15.0
+            }
+
+            # 2. Ambiguity recovery or transition
+            if self._is_ambiguous:
+                if len(self._known_responders) <= 1:
+                    self._is_ambiguous = False
+                    if len(self._known_responders) == 1:
+                        sole_inst, (sole_ip, sole_time) = next(iter(self._known_responders.items()))
+                        self._peer_instance_id = sole_inst
+                        self._peer_address = sole_ip
+                        self._local_bind_address = self.route_resolver.resolve_local_route(sole_ip, self.control_port)
+                        self._last_peer_seen = sole_time
+                    else:
+                        self._peer_instance_id = None
+                        self._peer_address = None
+                        self._local_bind_address = None
+                        self._last_peer_seen = 0.0
+            else:
+                # If currently paired with a peer, verify if it expired
+                if len(self._known_responders) == 0:
+                    self._peer_instance_id = None
+                    self._peer_address = None
+                    self._local_bind_address = None
+                    self._last_peer_seen = 0.0
 
     def start(self) -> None:
         with self._lock:

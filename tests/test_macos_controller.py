@@ -534,3 +534,160 @@ def test_macos_cross_process_ipc_lifecycle(temp_state_file):
     assert res_status2["owned_children_count"] == 0
 
     controller.shutdown()
+
+
+# ---------------------------------------------------------
+# Test Suite 9: Strict Status Purity & Snapshot Consistency
+# ---------------------------------------------------------
+
+class InstrumentedRouteResolver(RouteResolver):
+    def __init__(self, routes: dict):
+        self.routes = routes
+        self.call_count = 0
+
+    def resolve_local_route(self, target_ip: str, port: int) -> str:
+        self.call_count += 1
+        return self.routes.get(target_ip, "0.0.0.0")
+
+
+def test_strict_status_purity_and_zero_mutation(temp_state_file):
+    """Verifies that calling get_status() repeatedly causes ZERO mutations or RouteResolver calls."""
+    routes = {"198.168.10.5": "198.168.10.4", "198.168.10.99": "198.168.10.4"}
+    resolver = InstrumentedRouteResolver(routes)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-purity-test",
+        control_port=50290,
+        route_resolver=resolver,
+    )
+
+    runner = FakeProcessRunner()
+    controller = MacBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=FakeReceiverBuilder(),
+        discovery_service=discovery,
+        lock_port=50291,
+        ipc_port=50292,
+    )
+    controller.start()
+
+    # Create an initial discovery state with two responders (ambiguous)
+    discovery.handle_peer_message(
+        {"version": 1, "role": "windows", "instance_id": "win-1", "speaker_port": 5004},
+        "198.168.10.5",
+    )
+    discovery.handle_peer_message(
+        {"version": 1, "role": "windows", "instance_id": "win-2", "speaker_port": 5004},
+        "198.168.10.99",
+    )
+    controller.reconcile()
+
+    # Now simulate responder 2 having expired > 15s ago, but do NOT call refresh/reconcile yet
+    now = time.time()
+    discovery._known_responders["win-2"] = ("198.168.10.99", now - 25.0)
+    discovery._known_responders["win-1"] = ("198.168.10.5", now)
+
+    # Capture snapshot of mutable state
+    responders_before = dict(discovery._known_responders)
+    is_ambig_before = discovery._is_ambiguous
+    peer_inst_before = discovery._peer_instance_id
+    peer_addr_before = discovery._peer_address
+    bind_addr_before = discovery._local_bind_address
+    last_seen_before = discovery._last_peer_seen
+    route_calls_before = resolver.call_count
+    desired_before = controller._desired_state
+    running_pids_before = set(runner.running_pids)
+
+    # Call get_status() multiple times
+    for _ in range(10):
+        st = controller.get_status()
+        # Verify status observation matches un-mutated ambiguous state
+        assert st.controller_state == LifecycleState.AMBIGUOUS_PEER.value
+        assert st.peer_available is False
+        assert st.peer_address is None
+        assert st.local_bind_address is None
+
+    # Assert ZERO mutations occurred across all internal structures
+    assert discovery._known_responders == responders_before
+    assert discovery._is_ambiguous == is_ambig_before
+    assert discovery._peer_instance_id == peer_inst_before
+    assert discovery._peer_address == peer_addr_before
+    assert discovery._local_bind_address == bind_addr_before
+    assert discovery._last_peer_seen == last_seen_before
+    assert resolver.call_count == route_calls_before, "RouteResolver MUST NOT be called during get_status()!"
+    assert controller._desired_state == desired_before
+    assert set(runner.running_pids) == running_pids_before
+
+    controller.shutdown()
+
+
+def test_snapshot_consistency_and_explicit_ambiguity_recovery(temp_state_file):
+    """Verifies internal snapshot consistency and that ambiguity recovery only occurs via explicit reconcile."""
+    routes = {"198.168.10.5": "198.168.10.4", "198.168.10.99": "198.168.10.4"}
+    resolver = InstrumentedRouteResolver(routes)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-snap-test",
+        control_port=50293,
+        route_resolver=resolver,
+    )
+
+    runner = FakeProcessRunner()
+    builder = FakeReceiverBuilder()
+    controller = MacBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=builder,
+        discovery_service=discovery,
+        lock_port=50294,
+        ipc_port=50295,
+    )
+    controller.start()
+
+    # Introduce ambiguity
+    discovery.handle_peer_message(
+        {"version": 1, "role": "windows", "instance_id": "win-1", "speaker_port": 5004},
+        "198.168.10.5",
+    )
+    discovery.handle_peer_message(
+        {"version": 1, "role": "windows", "instance_id": "win-2", "speaker_port": 5004},
+        "198.168.10.99",
+    )
+    controller.reconcile()
+
+    # Expire win-2
+    now = time.time()
+    discovery._known_responders["win-2"] = ("198.168.10.99", now - 30.0)
+
+    # Status must strictly observe unrecovered ambiguous state
+    s1 = controller.get_status()
+    assert s1.controller_state == LifecycleState.AMBIGUOUS_PEER.value
+    assert s1.peer_available is False
+    assert s1.peer_address is None
+    assert s1.local_bind_address is None
+    initial_route_calls = resolver.call_count
+
+    # Explicit reconcile advances discovery state
+    controller.reconcile()
+
+    # Now ambiguity is recovered to win-1
+    s2 = controller.get_status()
+    assert s2.controller_state == LifecycleState.ACTIVE.value
+    assert s2.peer_available is True
+    assert s2.peer_address == "198.168.10.5"
+    assert s2.local_bind_address == "198.168.10.4"
+    assert s2.speaker_path_state == PathState.RUNNING.value
+    assert resolver.call_count == initial_route_calls + 1
+
+    # Subsequent Status calls are completely pure and do not invoke resolver again
+    for _ in range(5):
+        s3 = controller.get_status()
+        assert s3.peer_available is True
+        assert s3.peer_address == "198.168.10.5"
+    assert resolver.call_count == initial_route_calls + 1
+
+    controller.shutdown()
+
