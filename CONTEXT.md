@@ -17,8 +17,12 @@
 
 ## 2. 统一领域语言 (Ubiquitous Language)
 
-* **Windows Host**：局域网内的 Windows 操作系统主机。当前无物理扬声器、耳机及麦克风，作为系统音频输出的发送端（Audio Sink Client）与麦克风输入的接收端（Audio Source Client）。
-* **Mac Host**：局域网内的 macOS 操作系统主机。配备高品质内置扬声器与内置麦克风，作为扬声器播放端与麦克风采集端。
+* **Windows Host**：局域网内的 Windows 操作系统主机。当前无物理扬声器、耳机及物理麦克风。作为 Windows Playback Source 的发起方，以及 Windows Virtual Microphone Endpoint 的接入归宿。
+* **Mac Host**：局域网内的 macOS 操作系统主机。配备高品质内置扬声器与内置麦克风。作为 Mac Speaker Sink 的消费发声端，以及 Mac Microphone Source 的采集提供端。
+* **Windows Playback Source**：Windows 应用/系统产生、需要发送到 Mac 的播放音频。
+* **Mac Speaker Sink**：消费 Windows 播放音频并由 Mac 扬声器发声的一端。
+* **Mac Microphone Source**：Mac 内置麦克风产生的音频。
+* **Windows Virtual Microphone Endpoint**：接收来自 Mac 的麦克风音频，并在 Windows 中向应用暴露为麦克风输入设备。
 * **Deskflow**：基于局域网的开源键鼠共享工具，当前已在两台主机间平稳运行。在本项目中保持完全独立，不是 v0.1 的硬性依赖，严禁对其进行 fork 或侵入式修改。
 * **Audio Routing / Loopback (音频路由与环回)**：在操作系统层面将应用程序的音频流重定向至网络传输桥，或将接收到的网络音频流重定向至虚拟/物理录音与播放设备。
 * **SonoBus**：当前候选的端到端轻量开源 P2P 音频流传输软件。本阶段仅作为技术选型备选池成员，本轮不进行安装、配置、fork 或 vendor。
