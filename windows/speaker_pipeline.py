@@ -7,7 +7,7 @@ wasapi2src loopback=true low-latency=true [device=...]
   ! audioresample
   ! audio/x-raw,format=S16BE,rate=48000,channels=2
   ! rtpL16pay pt=96
-  ! udpsink host=<MAC_IP> port=<SPEAKER_PORT> sync=false
+  ! udpsink host=<MAC_IP> port=<SPEAKER_PORT> sync=false [bind-address=<LOCAL_IP>]
 """
 
 import os
@@ -30,6 +30,7 @@ class SpeakerPipelineBuilder:
         target_host: str,
         target_port: int,
         device_id: Optional[str] = None,
+        local_bind_ip: Optional[str] = None,
     ) -> List[str]:
         """Constructs the canonical command arguments list as individual tokens."""
         cmd = [
@@ -63,4 +64,7 @@ class SpeakerPipelineBuilder:
             f"port={target_port}",
             "sync=false",
         ])
+        if local_bind_ip and local_bind_ip != "0.0.0.0":
+            cmd.append(f"bind-address={local_bind_ip}")
+
         return cmd
