@@ -6,27 +6,30 @@
 
 ## 1. 领域使命与核心目标 (Mission & Vision)
 
-**使命**：让同一局域网中的 Windows PC 使用 Mac 的内置扬声器和麦克风。  
-**实现路径**：首选利用现有开源成熟软件，在**零新增硬件**的前提下建立双向音频流转发 Proof of Concept (PoC)。  
+**使命**：让同一桌面环境中的 Windows PC 使用 Mac 的内置扬声器和麦克风，形成低开销、低延迟、尽量无需人工切换的双机音频桥。  
+**实现原则**：优先复用成熟、可审计、可逆的用户态能力；先做 Proof of Concept (PoC)，再决定是否需要额外硬件或更深层系统集成。  
 **核心验收条件**：
-1. **资源低开销**：低 CPU 占用、低内存占用、低磁盘空间占用。
-2. **低延迟**：满足日常语音通话与系统多媒体播放的可接受延迟要求。
-3. **零硬件追加**：不购置额外外置声卡、USB 麦克风或音频物理转接线。
+1. **资源低开销**：低 CPU、低内存、低磁盘常驻占用。
+2. **低延迟且稳定**：日常多媒体播放不能持续断音、爆音或产生明显不可接受延迟。
+3. **零硬件追加优先**：PoC 阶段不购置额外外置声卡、USB 麦克风或音频物理转接线。
+4. **人耳 Gate**：端到端“可用”不能只看 meter / logs；真实播放质量必须由用户听感确认。
 
 ---
 
 ## 2. 统一领域语言 (Ubiquitous Language)
 
-* **Windows Host**：局域网内的 Windows 操作系统主机。当前无物理扬声器、耳机及物理麦克风。作为 Windows Playback Source 的发起方，以及 Windows Virtual Microphone Endpoint 的接入归宿。
-* **Mac Host**：局域网内的 macOS 操作系统主机。配备高品质内置扬声器与内置麦克风。作为 Mac Speaker Sink 的消费发声端，以及 Mac Microphone Source 的采集提供端。
-* **Windows Playback Source**：Windows 应用/系统产生、需要发送到 Mac 的播放音频。
-* **Mac Speaker Sink**：消费 Windows 播放音频并由 Mac 扬声器发声的一端。
+* **Windows Host**：Windows 主机。可产生系统/应用播放音频，并存在 Realtek 与显示/显卡相关 render endpoints；当前没有可用物理麦克风。目标上既是 Windows Playback Source，也是未来 Windows Virtual Microphone Endpoint 的接入归宿。
+* **Mac Host**：MacBook Air M1。具备内置扬声器与内置麦克风，作为 Mac Speaker Sink 与 Mac Microphone Source。
+* **Windows Playback Source**：Windows 应用/系统产生、需要发送到 Mac 的播放音频，包括浏览器/YouTube 等普通应用音频。
+* **Mac Speaker Sink**：消费 Windows 播放音频并由 MacBook Air Speakers 发声的一端。
 * **Mac Microphone Source**：Mac 内置麦克风产生的音频。
-* **Windows Virtual Microphone Endpoint**：接收来自 Mac 的麦克风音频，并在 Windows 中向应用暴露为麦克风输入设备。
-* **Deskflow**：基于局域网的开源键鼠共享工具，当前已在两台主机间平稳运行。在本项目中保持完全独立，不是 v0.1 的硬性依赖，严禁对其进行 fork 或侵入式修改。
-* **Audio Routing / Loopback (音频路由与环回)**：在操作系统层面将应用程序的音频流重定向至网络传输桥，或将接收到的网络音频流重定向至虚拟/物理录音与播放设备。
-* **SonoBus**：当前候选的端到端轻量开源 P2P 音频流传输软件。本阶段仅作为技术选型备选池成员，本轮不进行安装、配置、fork 或 vendor。
-* **BlackHole**：macOS 下的虚拟音频驱动。当前评估其并非 v0.1 最小 PoC 必需项，严禁提前引入造成环境污染。
+* **Windows Virtual Microphone Endpoint**：接收来自 Mac 的麦克风音频，并在 Windows 中向普通应用暴露为可选择的麦克风输入设备。
+* **Deskflow**：现有键鼠共享工具。两机已稳定通过它协作；本项目保持独立，不 fork、不侵入式修改。Deskflow 的现有直连网络也提供了双机连通性证据。
+* **WASAPI Loopback**：Windows 用户态系统播放捕获机制。当前已实证可以抓取系统/浏览器播放音频，不依赖 Stereo Mix 或虚拟声卡。
+* **GStreamer**：当前 Windows→Mac 用户态音频链路的主要实验框架。Windows 已验证 1.28.6；Mac 已有官方 Universal `GStreamer.framework` 1.24.8，暂定 `KEEP_CANDIDATE`。
+* **SonoBus**：已完成兼容性实验，但不再是当前 Windows→Mac 主路线。若最终采用 GStreamer，应作为实验残留进入后续清理 Gate。
+* **VB-CABLE**：Windows 上实验失败；官方 Pack45 在当前机器出现 PnP Code 10。除非出现新的明确兼容性证据，不再作为默认方案。
+* **BlackHole**：macOS 虚拟音频驱动。当前 PoC 不需要，禁止提前引入。
 
 ---
 
@@ -34,46 +37,102 @@
 
 | 维度 | Windows 端事实 | Mac 端事实 | 备注 |
 | :--- | :--- | :--- | :--- |
-| **物理音频外设** | 无独立扬声器、无耳机、无物理麦克风 | 具备内置扬声器、内置麦克风 | 硬件资源单向不对称 |
-| **键鼠共享状态** | 已通过 Deskflow 与 Mac 建立连接 | 已通过 Deskflow 与 Windows 建立连接 | Deskflow 独立运行，不作修改 |
-| **网络拓扑** | 同一局域网内 (LAN) | 同一局域网内 (LAN) | 具备高速低延迟直连条件 |
-| **权限与驱动** | 具备管理员权限 | 具备用户及 sudo 权限 | 遵循最小特权原则，避免安装未经评估的内核扩展 |
+| **播放能力** | 存在 Realtek 与显示/显卡相关 render endpoints；用户现场可听到 PC 屏幕/显示器侧播放 | MacBook Air Speakers 可用 | 不得再笼统描述为“Windows 无扬声器” |
+| **麦克风** | 当前没有可用物理麦克风/默认录音 endpoint | MacBook Air 内置麦克风可用 | 反向链路见 Issue #6 |
+| **GStreamer** | 官方 1.28.6 MSVC x86_64 已安装，可用 `wasapisrc` / RTP / UDP / Opus 等 | 官方 Universal 1.24.8 framework 已存在，约 461 MB，RTP/Opus/CoreAudio 插件齐全 | Mac 当前不需要升级 |
+| **键鼠共享** | Deskflow 正常 | Deskflow 正常 | 独立于音频项目 |
+| **网络拓扑** | 与 Mac 存在已验证的 1 Gbps 直连以太网路径 | 与 Windows 存在同一直连路径 | 音频 PoC 应优先复用直连路径；真实 IP 不入 Git |
+| **安全边界** | HVCI/VBS/Secure Boot/Defender 保持开启 | 不绕过 Gatekeeper/系统安全 | 不为音频桥降低系统安全 |
 
 ---
 
-## 4. 双机协作规范 (Dual-Machine Collaboration Rules)
+## 4. 当前架构事实与决策边界
 
-由于项目跨越两台不同系统的物理机器，并由两个独立运行的 IDE Agent 协同开发，必须严格遵循以下协作准则：
+### 4.1 Windows → Mac Speaker Path
 
-1. **统一远端仓库**：
-   - 唯一的 Git 仓库权威地址为 `https://github.com/carllx/desk-audio-bridge`。
-   - 默认分支为 `main`。
-2. **独立本地工作区**：
-   - 两台物理机器各维护一份本地独立的 Git 仓库 clone。
-3. **禁止并发直推 main**：
-   - 两台机器上的 IDE Agent 绝对禁止同时向 `main` 分支执行未经验证的直接 push。
-   - 所有实质功能开发应基于独立的 Feature Branch 与 GitHub Issue 进行。
-4. **目录与职责边界隔离**：
-   - `macos/**`：macOS 平台专属工作区。
-   - `windows/**`：Windows 平台专属工作区。
-   - `docs/**`、`README.md`、`CONTEXT.md`、`AGENTS.md`：属于两端共享状态，任何一方修改需确保对齐，严禁未协调的并发覆写。
-5. **跨机权威状态真理来源 (Canonical State)**：
-   - GitHub Issue / PR、已推送到远端的 Commit 以及仓库内的权威文档（`docs/`）是唯一的跨机有效状态。
-   - 严禁依赖不同 Agent 之间的口头转述或易失性会话假定。最终成果必须以远端落地的代码与文档为准。
+已证明的能力：
+
+`Windows app/system audio -> WASAPI Loopback -> GStreamer -> network -> GStreamer on Mac -> MacBook Air Speakers`
+
+但当前只证明“能发声”，**尚未达到日常可用质量**。
+
+当前用户真实听感：
+- YouTube 已经至少一次成功从 Windows 传到 Mac 并实际发声；
+- Mac 端存在明显延迟；
+- 存在 crackling / popping；
+- 存在断断续续、声音不完整；
+- 旧 Opus Candidate B 即使短测出现 `0 dropped samples`，也没有改善端到端人耳体验，因此不能判 PASS。
+
+当前 active frontier：**Issue #5**。
+
+下一项决定性实验：
+1. 从已知干净状态重新建立 sender/receiver；不相信旧 IDE runtime/PID 声明；
+2. 以相同直连网络与同一 Mac jitterbuffer 基线，A/B 比较 Opus RTP 与未压缩 RTP L16 PCM；
+3. 人耳连续播放质量是决定性 Gate；
+4. 若 PCM 仍断续，再将 `wasapisrc` → `wasapi2src` 作为单变量实验；
+5. 在质量稳定前，不进入进一步低延迟打磨。
+
+### 4.2 Mac → Windows Microphone Path
+
+当前 active/queued frontier：**Issue #6**。
+
+目标：
+
+`MacBook Air Microphone -> user-mode capture -> network -> Windows receive -> Windows microphone/input endpoint -> Windows app`
+
+重要边界：
+- Mac mic 的采集与网络传输预计可先做纯用户态 proof；
+- 让普通 Windows 应用真正看到一个可选择“麦克风”通常还需要 Windows input endpoint；
+- VB-CABLE 当前不可作为默认方案；
+- 不允许通过关闭 HVCI/VBS/Secure Boot/Defender 强行兼容驱动；
+- 在 Issue #5 speaker path 稳定前不要同时打开反向 mic，以免引入 feedback/echo 诊断噪声。
 
 ---
 
-## 5. 本地配置与隐私安全守则 (Privacy & Local Configurations)
+## 5. GitHub Issue 语义
 
-为防止仓库膨胀以及泄漏个人敏感信息，严格执行以下约束：
+- **#1**：SonoBus on Mac compatibility/resource probe — completed。
+- **#2**：Stereo Mix -> SonoBus — completed negative。
+- **#3**：旧 SonoBus 双机集成 — `not_planned`，已被 #5 取代；不得作为当前架构依据。
+- **#4**：VB-CABLE -> SonoBus — completed negative；Code 10，后续 pending cleanup。
+- **#5**：WASAPI/GStreamer Windows -> Mac speaker path — **OPEN，当前主 frontier，QUALITY FAIL / NOT ACCEPTED**。
+- **#6**：Mac mic -> Windows input — **OPEN，queued；#5 稳定后推进**。
 
-* **绝对禁止提交的内容**：
-  1. 真实内网/公网 IP 地址（除非在 `*.example` 中标记为 `192.168.1.xxx` 占位符）。
-  2. 带有具体用户名或机器名的本地绝对路径（如 `C:\Users\<username>\...` 或 `/Users/<username>/...`）。
-  3. 系统具体音频设备 GUID、硬件序列号或设备硬件指纹。
-  4. 任何敏感凭证、Token、API Key、Cookie 等。
-  5. 本地运行时产生的缓存、编译产物、原始内存转储文件（*.dump）、网络抓包（*.pcap）以及大型日志。
-  6. 真实录音测试文件（*.wav, *.mp3, *.flac 等），严禁造成 Git 历史膨胀。
-* **本地配置文件命名契约**：
-  - 需纳入 Git 跟踪的配置模板：统一命名为 `*.example`（如 `config.json.example`）。
-  - 各主机本地实际使用的配置文件：统一命名为 `*.local` 或 `*.local.*`，并在 `.gitignore` 中默认被完全忽略。
+当 IDE 输出与用户真实听感冲突时，以用户 Human Gate + Browser 复核后的 Issue canonical comment 为准，不接受 IDE 自报 PASS 自动升级为事实。
+
+---
+
+## 6. 双机协作规范 (Dual-Machine Collaboration Rules)
+
+1. **统一远端仓库**：`https://github.com/carllx/desk-audio-bridge`，默认分支 `main`。
+2. **独立本地工作区**：两台物理机器各维护独立 clone。
+3. **禁止并发直推 main**：实质实现应使用独立 Feature Branch + Issue；共享文件修改必须协调。
+4. **目录职责**：`macos/**`、`windows/**` 为平台专属；`docs/**`、`README.md`、`CONTEXT.md`、`AGENTS.md` 为共享状态。
+5. **跨机权威状态**：GitHub Issue / PR、远端 Commit、仓库权威文档是跨机 SSOT。口头 session 状态、后台 PID、自报“已启动”均不是长期事实。
+6. **Session 健康**：出现反复询问已知事实、重复旧结论、忽略 Human Gate、把局部 metric 当端到端 PASS 等退化信号时，在 Work Unit/阶段边界切 Fresh IDE session。
+
+---
+
+## 7. 本地配置与隐私安全守则 (Privacy & Local Configurations)
+
+绝对禁止提交：
+1. 真实内网/公网 IP（除非 example 占位符）；
+2. 带用户名/机器名的本地绝对路径；
+3. 音频 endpoint GUID / Instance ID / 设备硬件指纹；
+4. 凭证、Token、API Key、Cookie；
+5. cache、dump、pcap、大型日志；
+6. 真实录音测试文件。
+
+本地配置：
+- 模板：`*.example`
+- 实际主机配置：`*.local` / `*.local.*`，必须被 `.gitignore` 忽略。
+
+---
+
+## 8. Lifecycle Cleanup Obligations
+
+架构选定后再统一清理，避免边测边删导致诊断漂移：
+- Windows VB-CABLE failed driver/package：若仍存在，需清理；
+- Windows/macOS SonoBus：若最终不用，需卸载并清理实验残留；
+- macOS GStreamer.framework：当前 `KEEP_CANDIDATE`；若最终架构不再需要，必须先确认无其他软件依赖，再决定 REMOVE；
+- 不得因本项目不用某共享 framework 就盲删系统/其他应用依赖。
