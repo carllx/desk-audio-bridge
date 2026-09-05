@@ -2,9 +2,16 @@
 
 Implements multi-interface broadcast/handshake, source/bind resolution,
 and multiple-responder ambiguity detection:
-- Discovers candidate active IPv4 interfaces (strictly active/up, IPv4, private or link-local, non-loopback).
+- Discovers candidate active IPv4 interfaces:
+  - Must be up/active.
+  - Must be IPv4 and non-loopback.
+  - Must be on-link directly connected (has valid subnet mask / broadcast, not point-to-point /32).
+  - Excludes benchmark/tunnel subnets (198.18.0.0/15) while accepting RFC 1918, link-local (169.254.0.0/16),
+    and on-link LAN/Ethernet subnets.
+- Preflights dependencies; reports explicit error on enumeration failure instead of silent global broadcast.
 - Resolves route/bind deterministically via RouteResolver seam.
 - Detects multiple distinct opposite-role responders in discovery window and enters AMBIGUOUS_PEER.
+- Automatically recovers when secondary responders expire.
 """
 
 import ipaddress
@@ -27,13 +34,44 @@ from bridge_core.contract import (
 logger = logging.getLogger(__name__)
 
 
-def is_private_or_link_local_ipv4(ip_str: str) -> bool:
-    """Verifies that an IPv4 address is active, non-loopback, and private or link-local."""
+def is_eligible_onlink_ipv4(ip_str: str, netmask_str: Optional[str] = None) -> bool:
+    """Verifies that an IPv4 address is an eligible local/on-link LAN interface.
+    
+    Principles:
+    - Non-loopback.
+    - Not unreserved global Internet routable without subnet or tunneled.
+    - Excludes RFC 2544 benchmark / tunnel range (198.18.0.0/15) often used by virtual proxy adapters.
+    - Accepts RFC 1918 private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+    - Accepts RFC 3927 link-local (169.254.0.0/16).
+    - Accepts directly-connected on-link LAN subnets (has netmask <= /24 and >= /30, and not /32 or /31 point-to-point).
+    """
     try:
         ip = ipaddress.IPv4Address(ip_str)
-        if ip.is_loopback:
+        if ip.is_loopback or ip.is_unspecified:
             return False
-        return ip.is_private or ip.is_link_local
+
+        # Exclude RFC 2544 benchmark range (used by Meta Tunnel / Mihomo / etc.)
+        if ip in ipaddress.IPv4Network("198.18.0.0/15"):
+            return False
+
+        # Exclude point-to-point host tunnels (/32, /31, or /30)
+        if netmask_str:
+            net = ipaddress.IPv4Network((ip_str, netmask_str), strict=False)
+            if net.prefixlen >= 30:
+                return False
+
+        # Accepts RFC 1918 private or link-local
+        if ip.is_private or ip.is_link_local:
+            return True
+
+        # For non-RFC1918 addresses configured on direct Ethernet/LAN:
+        # If it has a standard local LAN subnet (/24, /23, /16 etc.), it qualifies as directly connected on-link
+        if netmask_str:
+            net = ipaddress.IPv4Network((ip_str, netmask_str), strict=False)
+            if 8 <= net.prefixlen <= 28:
+                return True
+
+        return False
     except Exception:
         return False
 
@@ -41,11 +79,18 @@ def is_private_or_link_local_ipv4(ip_str: str) -> bool:
 class InterfaceEnumerator:
     """Enumerates candidate IPv4 local interfaces and their subnet broadcast addresses."""
 
-    def get_candidate_interfaces(self) -> List[Tuple[str, str]]:
-        """Returns a list of (local_ip, broadcast_ip) tuples for active/up, private/link-local interfaces."""
-        candidates = []
+    def get_candidate_interfaces(self) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
+        """Returns (success, candidates_list, error_message).
+        
+        candidates_list contains (local_ip, broadcast_ip) tuples.
+        """
         try:
             import psutil
+        except ImportError:
+            return False, [], "Runtime dependency 'psutil' is missing; cannot enumerate network interfaces"
+
+        candidates = []
+        try:
             stats = psutil.net_if_stats()
             for iface_name, addrs in psutil.net_if_addrs().items():
                 stat = stats.get(iface_name)
@@ -56,10 +101,10 @@ class InterfaceEnumerator:
                 for addr in addrs:
                     if addr.family == socket.AF_INET:
                         ip = addr.address
-                        if not is_private_or_link_local_ipv4(ip):
+                        netmask = addr.netmask
+                        if not is_eligible_onlink_ipv4(ip, netmask):
                             continue
 
-                        netmask = addr.netmask
                         broadcast = None
                         if addr.broadcast:
                             broadcast = addr.broadcast
@@ -72,11 +117,9 @@ class InterfaceEnumerator:
                         if not broadcast:
                             broadcast = "255.255.255.255"
                         candidates.append((ip, broadcast))
-        except ImportError:
-            logger.warning("psutil not available; falling back to basic socket inspection")
+            return True, candidates, None
         except Exception as exc:
-            logger.debug("Interface enumeration failed: %s", exc)
-        return candidates
+            return False, [], f"Interface enumeration failed: {exc}"
 
 
 class RouteResolver:
@@ -128,6 +171,7 @@ class PeerDiscoveryService:
         self._peer_speaker_port: int = speaker_port
         self._peer_instance_id: Optional[str] = None
         self._last_peer_seen: float = 0.0
+        self._last_enumeration_error: Optional[str] = None
 
         # Ambiguity tracking: map of peer_instance_id -> (peer_ip, last_seen)
         self._known_responders: dict[str, Tuple[str, float]] = {}
@@ -144,19 +188,37 @@ class PeerDiscoveryService:
     @property
     def is_ambiguous(self) -> bool:
         with self._lock:
+            # First prune any responders expired > 15s to check recovery
+            now = time.time()
+            self._known_responders = {
+                k: v for k, v in self._known_responders.items() if (now - v[1]) < 15.0
+            }
+            if len(self._known_responders) <= 1 and self._is_ambiguous:
+                self._is_ambiguous = False
+                if len(self._known_responders) == 1:
+                    sole_inst, (sole_ip, sole_time) = next(iter(self._known_responders.items()))
+                    self._peer_instance_id = sole_inst
+                    self._peer_address = sole_ip
+                    self._local_bind_address = self.route_resolver.resolve_local_route(sole_ip, self.control_port)
+                    self._last_peer_seen = sole_time
             return self._is_ambiguous
+
+    @property
+    def last_enumeration_error(self) -> Optional[str]:
+        with self._lock:
+            return self._last_enumeration_error
 
     @property
     def peer_address(self) -> Optional[str]:
         with self._lock:
-            if self._is_ambiguous:
+            if self.is_ambiguous:
                 return None
             return self._peer_address
 
     @property
     def local_bind_address(self) -> Optional[str]:
         with self._lock:
-            if self._is_ambiguous:
+            if self.is_ambiguous:
                 return None
             return self._local_bind_address
 
@@ -201,12 +263,19 @@ class PeerDiscoveryService:
             self._recv_thread = None
 
     def broadcast_hello(self) -> None:
+        """Broadcasts HandshakeHello across candidate interfaces.
+        
+        If enumeration fails, records an error state and refuses silent global broadcast.
+        """
         if not self._running:
             return
 
-        candidates = self.enumerator.get_candidate_interfaces()
-        if not candidates:
-            candidates = [("0.0.0.0", "255.255.255.255")]
+        success, candidates, err = self.enumerator.get_candidate_interfaces()
+        with self._lock:
+            if not success or not candidates:
+                self._last_enumeration_error = err or "No eligible on-link IPv4 interfaces found"
+                return
+            self._last_enumeration_error = None
 
         for local_ip, bcast_ip in candidates:
             hello = HandshakeHello(
@@ -214,7 +283,7 @@ class PeerDiscoveryService:
                 role=self.local_role.value,
                 instance_id=self.instance_id,
                 speaker_port=self.speaker_port,
-                source_ip=local_ip if local_ip != "0.0.0.0" else None,
+                source_ip=local_ip,
             )
             data = json.dumps(hello.to_dict()).encode("utf-8")
 
@@ -222,11 +291,10 @@ class PeerDiscoveryService:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                if local_ip != "0.0.0.0":
-                    try:
-                        sock.bind((local_ip, 0))
-                    except Exception:
-                        pass
+                try:
+                    sock.bind((local_ip, 0))
+                except Exception:
+                    pass
                 sock.sendto(data, (bcast_ip, self.control_port))
                 if bcast_ip != "255.255.255.255":
                     sock.sendto(data, ("255.255.255.255", self.control_port))
@@ -235,6 +303,70 @@ class PeerDiscoveryService:
             finally:
                 if sock:
                     sock.close()
+
+    def handle_peer_message(self, msg: dict, peer_ip: str) -> None:
+        """Processes an incoming peer packet (used by both _listen_loop and automated tests)."""
+        msg_role = msg.get("role")
+        version = msg.get("version")
+        if version != CONTROL_PROTOCOL_VERSION or msg_role != self.target_role.value:
+            return
+
+        peer_inst = msg.get("instance_id", "")
+        peer_spk_port = msg.get("speaker_port", DEFAULT_SPEAKER_RTP_PORT)
+
+        now = time.time()
+        with self._lock:
+            # Prune responders expired > 15s
+            self._known_responders = {
+                k: v for k, v in self._known_responders.items() if (now - v[1]) < 15.0
+            }
+            self._known_responders[peer_inst] = (peer_ip, now)
+
+            if len(self._known_responders) > 1:
+                logger.warning(
+                    "Multiple opposite-role responders discovered (%s); entering ambiguous state",
+                    list(self._known_responders.keys()),
+                )
+                self._is_ambiguous = True
+                self._peer_address = None
+                self._local_bind_address = None
+                return
+
+            self._is_ambiguous = False
+
+        # Resolve local route to peer
+        local_source_ip = self.route_resolver.resolve_local_route(peer_ip, self.control_port)
+
+        # Reply with ACK if this was a HELLO and listener socket is open
+        if "peer_instance_id" not in msg and self._listener_sock:
+            ack = HandshakeAck(
+                version=CONTROL_PROTOCOL_VERSION,
+                role=self.local_role.value,
+                instance_id=self.instance_id,
+                speaker_port=self.speaker_port,
+                peer_instance_id=peer_inst,
+                source_ip=local_source_ip,
+            )
+            ack_bytes = json.dumps(ack.to_dict()).encode("utf-8")
+            try:
+                self._listener_sock.sendto(ack_bytes, (peer_ip, self.control_port))
+            except Exception as exc:
+                logger.debug("Failed sending ACK to %s: %s", peer_ip, exc)
+
+        with self._lock:
+            was_avail = (
+                (now - self._last_peer_seen) < 15.0
+                and self._peer_address is not None
+                and not self._is_ambiguous
+            )
+            self._peer_address = peer_ip
+            self._local_bind_address = local_source_ip
+            self._peer_instance_id = peer_inst
+            self._peer_speaker_port = peer_spk_port
+            self._last_peer_seen = now
+
+        if not was_avail and self.on_peer_discovered:
+            self.on_peer_discovered(peer_ip, local_source_ip, peer_spk_port, peer_inst)
 
     def _listen_loop(self) -> None:
         while self._running and self._listener_sock:
@@ -248,66 +380,4 @@ class PeerDiscoveryService:
             except Exception:
                 continue
 
-            msg_role = msg.get("role")
-            version = msg.get("version")
-            if version != CONTROL_PROTOCOL_VERSION or msg_role != self.target_role.value:
-                continue
-
-            peer_ip = addr[0]
-            peer_inst = msg.get("instance_id", "")
-            peer_spk_port = msg.get("speaker_port", DEFAULT_SPEAKER_RTP_PORT)
-
-            now = time.time()
-            with self._lock:
-                # Prune responders not seen for > 30s
-                self._known_responders = {
-                    k: v for k, v in self._known_responders.items() if (now - v[1]) < 30.0
-                }
-                self._known_responders[peer_inst] = (peer_ip, now)
-
-                # Check for multiple distinct opposite-role responders
-                if len(self._known_responders) > 1:
-                    logger.warning(
-                        "Multiple opposite-role responders discovered (%s); entering ambiguous state",
-                        list(self._known_responders.keys()),
-                    )
-                    self._is_ambiguous = True
-                    self._peer_address = None
-                    self._local_bind_address = None
-                    continue
-
-                self._is_ambiguous = False
-
-            # Resolve local route to peer
-            local_source_ip = self.route_resolver.resolve_local_route(peer_ip, self.control_port)
-
-            # Reply with ACK if this was a HELLO
-            if "peer_instance_id" not in msg:
-                ack = HandshakeAck(
-                    version=CONTROL_PROTOCOL_VERSION,
-                    role=self.local_role.value,
-                    instance_id=self.instance_id,
-                    speaker_port=self.speaker_port,
-                    peer_instance_id=peer_inst,
-                    source_ip=local_source_ip,
-                )
-                ack_bytes = json.dumps(ack.to_dict()).encode("utf-8")
-                try:
-                    self._listener_sock.sendto(ack_bytes, (peer_ip, self.control_port))
-                except Exception as exc:
-                    logger.debug("Failed sending ACK to %s: %s", peer_ip, exc)
-
-            with self._lock:
-                was_avail = (
-                    (time.time() - self._last_peer_seen) < 15.0
-                    and self._peer_address is not None
-                    and not self._is_ambiguous
-                )
-                self._peer_address = peer_ip
-                self._local_bind_address = local_source_ip
-                self._peer_instance_id = peer_inst
-                self._peer_speaker_port = peer_spk_port
-                self._last_peer_seen = now
-
-            if not was_avail and self.on_peer_discovered:
-                self.on_peer_discovered(peer_ip, local_source_ip, peer_spk_port, peer_inst)
+            self.handle_peer_message(msg, addr[0])

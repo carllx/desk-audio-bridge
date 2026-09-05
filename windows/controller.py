@@ -7,6 +7,7 @@ Implements the single-instance controller lifecycle:
 - Singleton guard: Ensures only one controller instance runs per host.
 - Ownership: Tracks and terminates ONLY owned child processes.
 - Local IPC Server: Serves Start/Stop/Status/Reconcile requests to CLI processes.
+- Dependency preflight: Refuses start if runtime dependencies are missing.
 """
 
 import json
@@ -27,6 +28,7 @@ from bridge_core.contract import (
     LifecycleState,
     PathState,
 )
+from bridge_core.preflight import check_runtime_dependencies
 from .device_resolver import WindowsDeviceResolver
 from .peer_discovery import PeerDiscoveryService
 from .process_runner import ProcessRunner, WindowsOwnedProcessRunner
@@ -222,6 +224,14 @@ class WindowsBridgeController:
         Returns False if another process holds the singleton lock.
         """
         with self._lock:
+            # Check runtime dependencies preflight
+            ok, err_msg = check_runtime_dependencies()
+            if not ok:
+                self._last_actionable_error = err_msg
+                self._controller_state = LifecycleState.ERROR
+                logger.error("Preflight failure: %s", err_msg)
+                return False
+
             if not self._singleton_lock.is_held:
                 if not self._singleton_lock.acquire():
                     logger.warning("Controller start rejected: another process holds the singleton lock")
@@ -281,6 +291,12 @@ class WindowsBridgeController:
                 )
                 else 0
             )
+            # Check if discovery reported an enumeration error
+            last_err = self._last_actionable_error
+            disc_err = getattr(self.discovery_service, "last_enumeration_error", None)
+            if not last_err and disc_err:
+                last_err = disc_err
+
             return ControllerStatus(
                 controller_state=self._controller_state.value,
                 desired_state=self._desired_state.value,
@@ -290,7 +306,7 @@ class WindowsBridgeController:
                 local_bind_address=self.discovery_service.local_bind_address,
                 speaker_path_state=self._speaker_path_state.value,
                 speaker_target_port=self.discovery_service.peer_speaker_port,
-                last_actionable_error=self._last_actionable_error,
+                last_actionable_error=last_err,
                 owned_children_count=owned_count,
                 owner_pid=os.getpid() if self._singleton_lock.is_held else None,
             )
@@ -326,6 +342,10 @@ class WindowsBridgeController:
             if not self.discovery_service.peer_available:
                 self._controller_state = LifecycleState.DISCOVERING
                 self.discovery_service.broadcast_hello()
+                disc_err = getattr(self.discovery_service, "last_enumeration_error", None)
+                if disc_err:
+                    self._last_actionable_error = disc_err
+                    self._controller_state = LifecycleState.ERROR
                 if self._speaker_child_pid is not None:
                     self.process_runner.stop_process(self._speaker_child_pid)
                     self._speaker_child_pid = None

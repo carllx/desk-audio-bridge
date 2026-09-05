@@ -4,9 +4,13 @@ Covers:
 1. Controller external behavior (idempotent Start/Stop, Status read-only, owned cleanup).
 2. Process-level cross-command control over IPC (Start, repeated Start, Status, Stop).
 3. Process-level singleton test (second owner denied, repeated start does not drop lock).
-4. Real subprocess singleton regression test (owner A running, owner B fails closed with exit code 2).
-5. Deterministic multi-interface test (asserts candidate B selected and candidate A not selected).
-6. Multiple-responder ambiguity test (responders A and B -> AMBIGUOUS_PEER, no silent pairing).
+4. Subprocess singleton fail-closed test (owner A running, owner B fails closed with exit code 2).
+5. Deterministic multi-interface route resolution through handle_peer_message seam:
+   - Peer B -> Candidate B local IP, NOT Candidate A local IP.
+   - End-to-end through controller reconcile: pipeline builder receives candidate B local bind IP.
+6. Actual Direct Link interface eligibility (accepts on-link LAN/Ethernet subnet, rejects loopback/tunnels).
+7. Dependency failure & enumeration failure tests (no silent global broadcast, reports actionable error).
+8. Multiple-responder ambiguity & automatic recovery when secondary peer expires.
 """
 
 import json
@@ -34,7 +38,7 @@ from windows.peer_discovery import (
     InterfaceEnumerator,
     PeerDiscoveryService,
     RouteResolver,
-    is_private_or_link_local_ipv4,
+    is_eligible_onlink_ipv4,
 )
 from windows.process_runner import ProcessRunner
 
@@ -73,6 +77,7 @@ class FakeDeviceResolver:
 class FakePipelineBuilder:
     def __init__(self, gst_available: bool = True):
         self._available = gst_available
+        self.last_built_cmd: Optional[List[str]] = None
 
     def is_gstreamer_available(self) -> bool:
         return self._available
@@ -87,6 +92,7 @@ class FakePipelineBuilder:
         cmd = ["fake-gst", f"--host={target_host}", f"--port={target_port}"]
         if local_bind_ip:
             cmd.append(f"--bind={local_bind_ip}")
+        self.last_built_cmd = cmd
         return cmd
 
 
@@ -104,6 +110,7 @@ class FakeDiscoveryService:
         self.local_bind_address = local_bind
         self.peer_speaker_port = peer_port
         self.is_ambiguous = is_ambiguous
+        self.last_enumeration_error = None
         self.started = False
         self.stopped = False
         self.broadcast_count = 0
@@ -152,7 +159,6 @@ def test_repeated_start_is_idempotent_and_creates_single_pipeline(temp_state_fil
     assert status1.speaker_path_state == PathState.RUNNING.value
     assert len(runner.started_commands) == 1
 
-    # Repeated Start
     assert controller.start() is True
     status2 = controller.get_status()
     assert status2.desired_state == DesiredState.ENABLED.value
@@ -257,14 +263,11 @@ def test_singleton_lock_held_across_repeated_starts(temp_state_file):
         ipc_port=ipc_port,
     )
 
-    # First start acquires lock
     assert controller.start() is True
 
-    # Repeated starts must retain the lock without dropping it
     for _ in range(3):
         assert controller.start() is True
 
-    # Second controller instance must fail start
     second_ctrl = WindowsBridgeController(
         state_file=temp_state_file,
         process_runner=FakeProcessRunner(),
@@ -276,14 +279,13 @@ def test_singleton_lock_held_across_repeated_starts(temp_state_file):
     )
     assert second_ctrl.start() is False, "Second controller process must fail to start!"
 
-    # Shutdown releases lock
     controller.shutdown()
     assert second_ctrl.start() is True
     second_ctrl.shutdown()
 
 
 # ---------------------------------------------------------
-# Test Suite 3: Deterministic Multi-Interface & Route Resolution
+# Test Suite 3: End-to-End Discovery Routing Seam
 # ---------------------------------------------------------
 
 class MockRouteResolver(RouteResolver):
@@ -294,103 +296,165 @@ class MockRouteResolver(RouteResolver):
         return self.routes.get(target_ip, "0.0.0.0")
 
 
-def test_deterministic_multi_interface_route_resolution():
-    candidate_a_local_ip = "192.168.1.100"  # Wi-Fi
+def test_end_to_end_discovery_routing_and_controller_bind(temp_state_file):
+    """Verifies that peer packet -> discovery -> route resolution -> controller -> GStreamer bind-address."""
+    candidate_a_local_ip = "192.168.10.10"  # Wi-Fi
     candidate_b_local_ip = "198.168.10.5"   # Direct Link
-    peer_direct_ip = "198.168.10.6"
+    peer_direct_ip = "198.168.10.6"        # Mac on Direct Link
 
-    route_map = {
+    routes = {
         peer_direct_ip: candidate_b_local_ip,
-        "192.168.1.200": candidate_a_local_ip,
+        "192.168.10.1": candidate_a_local_ip,
     }
-    resolver = MockRouteResolver(route_map)
+    resolver = MockRouteResolver(routes)
 
     discovery = PeerDiscoveryService(
         local_role=HostRole.WINDOWS,
-        instance_id="win-disc-test",
+        instance_id="win-disc-e2e",
         control_port=50171,
         route_resolver=resolver,
     )
-    discovery.start()
 
-    # Send peer greeting from peer_direct_ip (Mac Direct Link)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    hello = {
+    runner = FakeProcessRunner()
+    builder = FakePipelineBuilder()
+    controller = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=builder,
+        discovery_service=discovery,
+        lock_port=50173,
+        ipc_port=50174,
+    )
+    controller.start()
+
+    # Pass peer greeting directly through discovery's handle_peer_message seam
+    hello_msg = {
         "version": 1,
         "role": "macos",
         "instance_id": "mac-m1-direct",
         "speaker_port": 5004,
     }
-    # Send locally to socket
-    s.sendto(json.dumps(hello).encode("utf-8"), ("127.0.0.1", 50171))
-    s.close()
+    discovery.handle_peer_message(hello_msg, peer_direct_ip)
 
-    time.sleep(0.5)
-    # Manually trigger peer greeting with peer_direct_ip to verify resolver selection
-    local_source_ip = resolver.resolve_local_route(peer_direct_ip, 50171)
-    
-    # Assertive verification of interface discrimination
-    assert local_source_ip == candidate_b_local_ip, "Must resolve to candidate B (direct link)"
-    assert local_source_ip != candidate_a_local_ip, "Must NOT resolve to candidate A (Wi-Fi)"
-    discovery.stop()
+    # 1. Assert discovery level
+    assert discovery.peer_available is True
+    assert discovery.peer_address == peer_direct_ip
+    assert discovery.local_bind_address == candidate_b_local_ip
+    assert discovery.local_bind_address != candidate_a_local_ip
+
+    # 2. Trigger reconcile / check controller level
+    controller.reconcile()
+    status = controller.get_status()
+    assert status.peer_available is True
+    assert status.peer_address == peer_direct_ip
+    assert status.local_bind_address == candidate_b_local_ip
+
+    # 3. Assert GStreamer command received candidate B bind address
+    assert builder.last_built_cmd is not None
+    assert f"--bind={candidate_b_local_ip}" in builder.last_built_cmd
+    assert f"--bind={candidate_a_local_ip}" not in builder.last_built_cmd
+
+    controller.shutdown()
 
 
-def test_interface_eligibility_classification():
-    """Verifies that only active private or link-local non-loopback IPv4 addresses qualify."""
-    assert is_private_or_link_local_ipv4("192.168.1.10") is True
-    assert is_private_or_link_local_ipv4("10.0.0.5") is True
-    assert is_private_or_link_local_ipv4("172.16.0.2") is True
-    assert is_private_or_link_local_ipv4("169.254.10.20") is True  # Link-local
-    assert is_private_or_link_local_ipv4("127.0.0.1") is False    # Loopback rejected
-    assert is_private_or_link_local_ipv4("8.8.8.8") is False      # Public internet IP rejected
+def test_actual_direct_link_eligibility():
+    """Verifies that the on-link eligibility rule accepts direct LAN/Ethernet subnets and rejects invalid ones."""
+    # Current direct link topology on Windows host: 198.168.10.5 / 255.255.255.0 (/24)
+    assert is_eligible_onlink_ipv4("198.168.10.5", "255.255.255.0") is True
+
+    # Standard RFC 1918 LAN (Wi-Fi)
+    assert is_eligible_onlink_ipv4("192.168.10.10", "255.255.255.0") is True
+
+    # Link-local interface
+    assert is_eligible_onlink_ipv4("169.254.10.20", "255.255.0.0") is True
+
+    # Excluded: Loopback
+    assert is_eligible_onlink_ipv4("127.0.0.1", "255.0.0.0") is False
+
+    # Excluded: Virtual benchmark/proxy tunnel (Mihomo/Meta Tunnel: 198.18.0.1/30)
+    assert is_eligible_onlink_ipv4("198.18.0.1", "255.255.255.252") is False
+
+    # Excluded: Point-to-point host tunnels (/32)
+    assert is_eligible_onlink_ipv4("10.0.0.1", "255.255.255.255") is False
 
 
 # ---------------------------------------------------------
-# Test Suite 4: Multiple-Responder Ambiguity Handling
+# Test Suite 4: Dependency & Enumeration Failure
 # ---------------------------------------------------------
 
-def test_multiple_responder_ambiguity():
+class FailingInterfaceEnumerator(InterfaceEnumerator):
+    def get_candidate_interfaces(self):
+        return False, [], "Simulated network adapter enumeration failure"
+
+
+def test_enumeration_failure_reports_actionable_error(temp_state_file):
     discovery = PeerDiscoveryService(
         local_role=HostRole.WINDOWS,
-        instance_id="win-ambig-test",
-        control_port=50172,
+        instance_id="win-fail-test",
+        control_port=50175,
+        interface_enumerator=FailingInterfaceEnumerator(),
     )
-    discovery.start()
+    controller = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=FakeProcessRunner(),
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=FakePipelineBuilder(),
+        discovery_service=discovery,
+        lock_port=50176,
+        ipc_port=50177,
+    )
+    controller.start()
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Peer 1 arrives
-    hello1 = {
-        "version": 1,
-        "role": "macos",
-        "instance_id": "mac-air-1",
-        "speaker_port": 5004,
-    }
-    s.sendto(json.dumps(hello1).encode("utf-8"), ("127.0.0.1", 50172))
-    time.sleep(0.3)
-    assert discovery.peer_available is True
-    assert discovery.is_ambiguous is False
+    # Reconcile attempts discovery broadcast which fails cleanly
+    controller.reconcile()
+    status = controller.get_status()
 
-    # Peer 2 arrives (distinct opposite-role instance)
-    hello2 = {
-        "version": 1,
-        "role": "macos",
-        "instance_id": "mac-air-2",
-        "speaker_port": 5004,
-    }
-    s.sendto(json.dumps(hello2).encode("utf-8"), ("127.0.0.1", 50172))
-    time.sleep(0.3)
+    assert status.controller_state == LifecycleState.ERROR.value
+    assert "Simulated network adapter enumeration failure" in status.last_actionable_error
+    assert status.peer_available is False
 
-    # Must enter ambiguous state without picking one randomly
-    assert discovery.is_ambiguous is True, "Must detect multiple responders and enter ambiguous state!"
-    assert discovery.peer_available is False, "Must NOT pair when ambiguous!"
-    assert discovery.peer_address is None
-
-    s.close()
-    discovery.stop()
+    controller.shutdown()
 
 
 # ---------------------------------------------------------
-# Test Suite 5: Cross-Process IPC Control
+# Test Suite 5: Multiple-Responder Ambiguity & Recovery
+# ---------------------------------------------------------
+
+def test_multiple_responder_ambiguity_and_recovery():
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.WINDOWS,
+        instance_id="win-ambig-recov",
+        control_port=50178,
+    )
+
+    # 1. Peer 1 arrives
+    msg1 = {"version": 1, "role": "macos", "instance_id": "mac-air-1", "speaker_port": 5004}
+    discovery.handle_peer_message(msg1, "198.168.10.6")
+    assert discovery.peer_available is True
+    assert discovery.is_ambiguous is False
+    assert discovery.peer_address == "198.168.10.6"
+
+    # 2. Peer 2 arrives -> ambiguity
+    msg2 = {"version": 1, "role": "macos", "instance_id": "mac-air-2", "speaker_port": 5004}
+    discovery.handle_peer_message(msg2, "198.168.10.7")
+    assert discovery.is_ambiguous is True
+    assert discovery.peer_available is False
+    assert discovery.peer_address is None
+
+    # 3. Simulate Peer 2 expiring (>15 seconds ago) while Peer 1 remains fresh
+    now = time.time()
+    discovery._known_responders["mac-air-2"] = ("198.168.10.7", now - 20.0)
+    discovery._known_responders["mac-air-1"] = ("198.168.10.6", now)
+
+    # Calling is_ambiguous automatically prunes expired peers and recovers sole responder
+    assert discovery.is_ambiguous is False
+    assert discovery.peer_available is True
+    assert discovery.peer_address == "198.168.10.6"
+
+
+# ---------------------------------------------------------
+# Test Suite 6: Cross-Process IPC Control
 # ---------------------------------------------------------
 
 def test_cross_process_ipc_lifecycle(temp_state_file):
