@@ -22,6 +22,9 @@ caches/
 .cache/
 tmp/
 temp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Performance traces & profiling dumps
 *.dump
