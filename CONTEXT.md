@@ -50,42 +50,31 @@
 
 ### 4.1 Windows → Mac Speaker Path
 
-已证明的能力：
+已达成的稳定基线：
 
-`Windows app/system audio -> WASAPI Loopback -> GStreamer -> network -> GStreamer on Mac -> MacBook Air Speakers`
+`Windows app/system audio -> wasapi2src loopback -> GStreamer RTP L16/UDP -> network -> GStreamer on Mac -> MacBook Air Speakers`
 
-但当前只证明“能发声”，**尚未达到日常可用质量**。
-
-当前用户真实听感：
-- YouTube 已经至少一次成功从 Windows 传到 Mac 并实际发声；
-- Mac 端存在明显延迟；
-- 存在 crackling / popping；
-- 存在断断续续、声音不完整；
-- 旧 Opus Candidate B 即使短测出现 `0 dropped samples`，也没有改善端到端人耳体验，因此不能判 PASS。
-
-当前 active frontier：**Issue #5**。
-
-下一项决定性实验：
-1. 从已知干净状态重新建立 sender/receiver；不相信旧 IDE runtime/PID 声明；
-2. 以相同直连网络与同一 Mac jitterbuffer 基线，A/B 比较 Opus RTP 与未压缩 RTP L16 PCM；
-3. 人耳连续播放质量是决定性 Gate；
-4. 若 PCM 仍断续，再将 `wasapisrc` → `wasapi2src` 作为单变量实验；
-5. 在质量稳定前，不进入进一步低延迟打磨。
+当前状态与事实：
+- **Issue #5 阶段性收口**：已通过当前 human listening gate，端到端听感连续、丝滑，无明显噼啪；
+- **当前稳定候选**：`wasapi2src -> RTP L16/UDP -> Mac GStreamer -> MacBook Air Speakers`；
+- **接口绑定约束**：在多网卡环境下，Mac receiver 需显式声明绑定直连接口地址（`address=<MAC_DIRECT_IP>`）；
+- **日常可用性体验**：目前尚依赖手动终端命令，未封装为日常易用的 Start/Stop 体验，该部分工作独立解耦为后续 Integration Issue。
 
 ### 4.2 Mac → Windows Microphone Path
 
-当前 active/queued frontier：**Issue #6**。
+当前 active/primary frontier：**Issue #6**。
 
 目标：
 
 `MacBook Air Microphone -> user-mode capture -> network -> Windows receive -> Windows microphone/input endpoint -> Windows app`
 
-重要边界：
-- Mac mic 的采集与网络传输预计可先做纯用户态 proof；
-- 让普通 Windows 应用真正看到一个可选择“麦克风”通常还需要 Windows input endpoint；
-- VB-CABLE 当前不可作为默认方案；
-- 不允许通过关闭 HVCI/VBS/Secure Boot/Defender 强行兼容驱动；
-- 在 Issue #5 speaker path 稳定前不要同时打开反向 mic，以免引入 feedback/echo 诊断噪声。
+重要边界与推进阶段：
+- **当前事实**：Mac 内置麦克风尚不能在 Windows 普通语音输入（如会议软件、语音识别等）中使用；Windows 端普通应用尚无由 Mac mic 驱动的 selectable microphone endpoint；
+- **分阶段推进**：
+  - **Phase A**：优先在网络与数据流层面证明 `Mac mic -> network -> Windows receive level`（验证麦克风用户态采集与网络送达）；
+  - **Phase B**：再解决 Windows 端 selectable microphone endpoint（向系统/普通应用暴露为可用录音设备）；
+  - 严禁将两阶段混杂在一起，避免诊断断点模糊；
+- 在 Issue #5 speaker path 稳定后，Issue #6 作为当前核心主战场推进。
 
 ---
 
@@ -95,8 +84,9 @@
 - **#2**：Stereo Mix -> SonoBus — completed negative。
 - **#3**：旧 SonoBus 双机集成 — `not_planned`，已被 #5 取代；不得作为当前架构依据。
 - **#4**：VB-CABLE -> SonoBus — completed negative；Code 10，后续 pending cleanup。
-- **#5**：WASAPI/GStreamer Windows -> Mac speaker path — **OPEN，当前主 frontier，QUALITY FAIL / NOT ACCEPTED**。
-- **#6**：Mac mic -> Windows input — **OPEN，queued；#5 稳定后推进**。
+- **#5**：WASAPI/GStreamer Windows -> Mac speaker path — **COMPLETED，已通过当前 human listening gate 达成基线收口**。
+- **#6**：Mac mic -> Windows input — **OPEN，当前 primary frontier，分 Phase A/B 推进**。
+- **#7（待创建）**：Integration：将双向音频桥收敛为日常可启动/停止的用户体验 — **QUEUED，在双向链路能力稳定后推进**。
 
 当 IDE 输出与用户真实听感冲突时，以用户 Human Gate + Browser 复核后的 Issue canonical comment 为准，不接受 IDE 自报 PASS 自动升级为事实。
 
