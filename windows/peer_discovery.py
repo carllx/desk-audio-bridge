@@ -11,7 +11,9 @@ from bridge_core.peer_discovery import (
     HandshakeAck,
     HandshakeHello,
     HostRole,
+    InterfaceClassifier,
     InterfaceEnumerator,
+    InterfaceMedium,
     PeerDiscoveryService,
     RouteResolver,
     is_eligible_onlink_ipv4,
@@ -24,8 +26,11 @@ __all__ = [
     "HandshakeAck",
     "HandshakeHello",
     "HostRole",
+    "InterfaceClassifier",
     "InterfaceEnumerator",
+    "InterfaceMedium",
     "PeerDiscoveryService",
     "RouteResolver",
     "is_eligible_onlink_ipv4",
 ]
+

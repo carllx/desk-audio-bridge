@@ -35,7 +35,9 @@ from bridge_core.contract import (
 from windows.cli import send_ipc_command
 from windows.controller import SingleInstanceLock, WindowsBridgeController
 from windows.peer_discovery import (
+    InterfaceClassifier,
     InterfaceEnumerator,
+    InterfaceMedium,
     PeerDiscoveryService,
     RouteResolver,
     is_eligible_onlink_ipv4,
@@ -574,4 +576,223 @@ def test_route_drift_prevention_on_multi_interface(temp_state_file):
     assert list(runner.running_pids) == [initial_running_pid]
 
     controller.shutdown()
+
+
+# ---------------------------------------------------------
+# Test Suite 9: Issue #28 Wired-First Route Election
+# ---------------------------------------------------------
+
+class FakeClassifier(InterfaceClassifier):
+    def __init__(self, ip_to_medium: dict):
+        self.ip_to_medium = ip_to_medium
+
+    def classify_interface(self, ip_str: str) -> InterfaceMedium:
+        return self.ip_to_medium.get(ip_str, InterfaceMedium.OTHER)
+
+
+class FailingClassifier(InterfaceClassifier):
+    def classify_interface(self, ip_str: str) -> InterfaceMedium:
+        raise RuntimeError("Simulated interface classification failure")
+
+
+class DictRouteResolver(RouteResolver):
+    def __init__(self, routes: dict):
+        self.routes = routes
+
+    def resolve_local_route(self, target_ip: str, port: int) -> str:
+        return self.routes.get(target_ip, "0.0.0.0")
+
+
+WF_ETHERNET_PEER_IP = "198.168.10.5"
+WF_ETHERNET_LOCAL_IP = "198.168.10.4"
+WF_WIFI_PEER_IP = "192.168.10.10"
+WF_WIFI_LOCAL_IP = "192.168.10.70"
+
+WF_ROUTES = {
+    WF_ETHERNET_PEER_IP: WF_ETHERNET_LOCAL_IP,
+    WF_WIFI_PEER_IP: WF_WIFI_LOCAL_IP,
+}
+
+WF_MEDIUM_MAP = {
+    WF_ETHERNET_LOCAL_IP: InterfaceMedium.WIRED_ETHERNET,
+    WF_WIFI_LOCAL_IP: InterfaceMedium.WIFI,
+}
+
+
+def test_wired_first_wifi_arrives_first_ethernet_arrives_second():
+    """1. Same peer: Wi-Fi arrival first, Ethernet arrival second -> Ethernet upgrades and wins."""
+    resolver = DictRouteResolver(WF_ROUTES)
+    classifier = FakeClassifier(WF_MEDIUM_MAP)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-wf-test",
+        control_port=50301,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+    )
+
+    hello_msg = {
+        "version": 1,
+        "role": "windows",
+        "instance_id": "win-peer-1",
+        "speaker_port": 5004,
+    }
+
+    # Wi-Fi packet arrives first
+    discovery.handle_peer_message(hello_msg, WF_WIFI_PEER_IP)
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_WIFI_PEER_IP
+    assert discovery.local_bind_address == WF_WIFI_LOCAL_IP
+
+    # Ethernet packet arrives second for the SAME peer
+    discovery.handle_peer_message(hello_msg, WF_ETHERNET_PEER_IP)
+    # Ethernet must upgrade and win!
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_ETHERNET_PEER_IP
+    assert discovery.local_bind_address == WF_ETHERNET_LOCAL_IP
+
+
+def test_wired_first_ethernet_arrives_first_wifi_arrives_second():
+    """2. Same peer: Ethernet arrival first, Wi-Fi arrival second -> Ethernet remains."""
+    resolver = DictRouteResolver(WF_ROUTES)
+    classifier = FakeClassifier(WF_MEDIUM_MAP)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-wf-test",
+        control_port=50302,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+    )
+
+    hello_msg = {
+        "version": 1,
+        "role": "windows",
+        "instance_id": "win-peer-1",
+        "speaker_port": 5004,
+    }
+
+    # Ethernet arrives first
+    discovery.handle_peer_message(hello_msg, WF_ETHERNET_PEER_IP)
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_ETHERNET_PEER_IP
+    assert discovery.local_bind_address == WF_ETHERNET_LOCAL_IP
+
+    # Wi-Fi arrives later
+    discovery.handle_peer_message(hello_msg, WF_WIFI_PEER_IP)
+    # Ethernet must remain selected
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_ETHERNET_PEER_IP
+    assert discovery.local_bind_address == WF_ETHERNET_LOCAL_IP
+
+
+def test_wired_first_ethernet_only():
+    """3. Same peer: Ethernet only -> Ethernet selected."""
+    resolver = DictRouteResolver(WF_ROUTES)
+    classifier = FakeClassifier(WF_MEDIUM_MAP)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-wf-test",
+        control_port=50303,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+    )
+
+    hello_msg = {
+        "version": 1,
+        "role": "windows",
+        "instance_id": "win-peer-1",
+        "speaker_port": 5004,
+    }
+
+    discovery.handle_peer_message(hello_msg, WF_ETHERNET_PEER_IP)
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_ETHERNET_PEER_IP
+    assert discovery.local_bind_address == WF_ETHERNET_LOCAL_IP
+
+
+def test_wired_first_wifi_only_fallback():
+    """4. Same peer: Wi-Fi only -> Wi-Fi fallback permitted."""
+    resolver = DictRouteResolver(WF_ROUTES)
+    classifier = FakeClassifier(WF_MEDIUM_MAP)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-wf-test",
+        control_port=50304,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+    )
+
+    hello_msg = {
+        "version": 1,
+        "role": "windows",
+        "instance_id": "win-peer-1",
+        "speaker_port": 5004,
+    }
+
+    discovery.handle_peer_message(hello_msg, WF_WIFI_PEER_IP)
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_WIFI_PEER_IP
+    assert discovery.local_bind_address == WF_WIFI_LOCAL_IP
+
+
+def test_two_distinct_peer_ids_ambiguous_regardless_of_medium():
+    """5. Two distinct peer IDs -> ambiguous regardless of one being Ethernet."""
+    resolver = DictRouteResolver({
+        WF_ETHERNET_PEER_IP: WF_ETHERNET_LOCAL_IP,
+        "198.168.10.99": WF_ETHERNET_LOCAL_IP,
+    })
+    classifier = FakeClassifier({WF_ETHERNET_LOCAL_IP: InterfaceMedium.WIRED_ETHERNET})
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-wf-test",
+        control_port=50305,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+    )
+
+    # Peer 1 on Ethernet
+    discovery.handle_peer_message(
+        {"version": 1, "role": "windows", "instance_id": "win-peer-1", "speaker_port": 5004},
+        WF_ETHERNET_PEER_IP,
+    )
+    assert discovery.is_ambiguous is False
+    assert discovery.peer_available is True
+
+    # Peer 2 on another IP
+    discovery.handle_peer_message(
+        {"version": 1, "role": "windows", "instance_id": "win-peer-2", "speaker_port": 5004},
+        "198.168.10.99",
+    )
+
+    # MUST enter AMBIGUOUS_PEER, never auto-select peer-1 merely because it has an Ethernet path
+    assert discovery.is_ambiguous is True
+    assert discovery.peer_available is False
+    assert discovery.peer_address is None
+    assert discovery.local_bind_address is None
+
+
+def test_classifier_failure_safe_fallback():
+    """6. Classifier exception / failure safely falls back without crashing."""
+    resolver = DictRouteResolver(WF_ROUTES)
+    failing_classifier = FailingClassifier()
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-wf-test",
+        control_port=50309,
+        route_resolver=resolver,
+        interface_classifier=failing_classifier,
+    )
+
+    hello_msg = {
+        "version": 1,
+        "role": "windows",
+        "instance_id": "win-peer-1",
+        "speaker_port": 5004,
+    }
+
+    # Delivering packet should NOT raise exception, must safely handle
+    discovery.handle_peer_message(hello_msg, WF_ETHERNET_PEER_IP)
+    assert discovery.peer_available is True
+    assert discovery.peer_address == WF_ETHERNET_PEER_IP
+
 
