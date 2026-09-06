@@ -12,16 +12,23 @@ from typing import Any, Dict, Optional
 CONTROL_PROTOCOL_VERSION = 1
 DEFAULT_CONTROL_PORT = 50100
 DEFAULT_SPEAKER_RTP_PORT = 5004
+DEFAULT_MIC_RTP_PORT = 5006
 
 # Local IPC control surface
 DEFAULT_LOCAL_IPC_PORT = 50106
 DEFAULT_SINGLETON_PORT = 50105
 
-# RTP L16 canonical audio parameters
+# RTP L16 canonical audio parameters - Speaker
 CANONICAL_SAMPLE_RATE = 48000
 CANONICAL_CHANNELS = 2
 CANONICAL_PAYLOAD_TYPE = 96
 CANONICAL_ENCODING_NAME = "L16"
+
+# RTP L16 canonical audio parameters - Microphone (Mac mic -> Windows)
+CANONICAL_MIC_SAMPLE_RATE = 48000
+CANONICAL_MIC_CHANNELS = 1
+CANONICAL_MIC_PAYLOAD_TYPE = 97
+CANONICAL_MIC_ENCODING_NAME = "L16"
 
 
 class HostRole(str, Enum):
@@ -49,6 +56,7 @@ class PathState(str, Enum):
     STARTING = "STARTING"
     RUNNING = "RUNNING"
     STOPPED = "STOPPED"
+    UNAVAILABLE = "UNAVAILABLE"
     FAILED = "FAILED"
 
 
@@ -90,6 +98,11 @@ class ControllerStatus:
     last_actionable_error: Optional[str]
     owned_children_count: int
     owner_pid: Optional[int] = None
+    microphone_path_state: str = PathState.IDLE.value
+    microphone_port: int = DEFAULT_MIC_RTP_PORT
+    pack43_available: bool = False
+    last_actionable_microphone_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+

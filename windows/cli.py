@@ -83,7 +83,7 @@ def main():
     parser = argparse.ArgumentParser(description="desk-audio-bridge Windows controller")
     parser.add_argument(
         "command",
-        choices=["start", "stop", "status", "reconcile", "run"],
+        choices=["start", "stop", "status", "reconcile", "run", "mic-enable", "mic-disable"],
         help="Action to execute",
     )
     parser.add_argument("--json", action="store_true", help="Output status in JSON format")
@@ -122,6 +122,24 @@ def main():
         else:
             print("No active controller host to reconcile")
 
+    elif args.command == "mic-enable":
+        if not ensure_controller_host_running():
+            print("Failed to start or connect to controller host", file=sys.stderr)
+            sys.exit(1)
+        res = send_ipc_command("mic-enable")
+        if res and res.get("success"):
+            print("Microphone enabled")
+        else:
+            print(f"Failed to enable microphone: {res}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "mic-disable":
+        res = send_ipc_command("mic-disable")
+        if res is not None:
+            print("Microphone disabled")
+        else:
+            print("No active controller host to disable microphone")
+
     elif args.command == "status":
         res = send_ipc_command("status")
         if res is not None:
@@ -145,9 +163,14 @@ def main():
             print(f"Local Bind Address:    {status_dict.get('local_bind_address') or 'None'}")
             print(f"Speaker Path State:    {status_dict.get('speaker_path_state')}")
             print(f"Speaker Port:          {status_dict.get('speaker_target_port')}")
+            print(f"Microphone Path State: {status_dict.get('microphone_path_state')}")
+            print(f"Microphone Port:       {status_dict.get('microphone_port')}")
+            print(f"Pack43 Available:      {status_dict.get('pack43_available')}")
             print(f"Owned Children Count:  {status_dict.get('owned_children_count')}")
             if status_dict.get("last_actionable_error"):
                 print(f"Last Error:            {status_dict.get('last_actionable_error')}")
+            if status_dict.get("last_actionable_microphone_error"):
+                print(f"Last Mic Error:        {status_dict.get('last_actionable_microphone_error')}")
 
 
 if __name__ == "__main__":
