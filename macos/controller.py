@@ -21,6 +21,7 @@ from typing import Optional
 
 from bridge_core.contract import (
     DEFAULT_LOCAL_IPC_PORT,
+    DEFAULT_MIC_RTP_PORT,
     DEFAULT_SINGLETON_PORT,
     DEFAULT_SPEAKER_RTP_PORT,
     ControllerStatus,
@@ -34,6 +35,7 @@ from bridge_core.preflight import check_runtime_dependencies
 from bridge_core.process_runner import ProcessRunner
 
 from .device_resolver import MacCoreAudioDeviceResolver
+from .microphone_sender import MicrophoneSenderBuilder
 from .process_runner import MacOwnedProcessRunner
 from .speaker_receiver import SpeakerReceiverBuilder
 
@@ -154,6 +156,18 @@ class LocalControlServer:
                     res = {"success": True}
                 elif cmd == "status":
                     res = self.controller.get_status().to_dict()
+                elif cmd == "mic-enable":
+                    success = self.controller.set_microphone_enabled(True)
+                    res = {
+                        "success": success,
+                        "microphone_path_state": self.controller.get_status().microphone_path_state,
+                    }
+                elif cmd == "mic-disable":
+                    success = self.controller.set_microphone_enabled(False)
+                    res = {
+                        "success": success,
+                        "microphone_path_state": self.controller.get_status().microphone_path_state,
+                    }
                 else:
                     res = {"error": f"Unknown command {cmd}"}
 
@@ -180,6 +194,7 @@ class MacBridgeController:
         device_resolver: Optional[MacCoreAudioDeviceResolver] = None,
         pipeline_builder: Optional[SpeakerReceiverBuilder] = None,
         discovery_service: Optional[PeerDiscoveryService] = None,
+        microphone_sender_builder: Optional[MicrophoneSenderBuilder] = None,
         lock_port: int = DEFAULT_SINGLETON_PORT,
         ipc_port: int = DEFAULT_LOCAL_IPC_PORT,
     ):
@@ -187,6 +202,9 @@ class MacBridgeController:
         self.process_runner = process_runner or MacOwnedProcessRunner()
         self.device_resolver = device_resolver or MacCoreAudioDeviceResolver()
         self.pipeline_builder = pipeline_builder or SpeakerReceiverBuilder()
+        self.microphone_sender_builder = (
+            microphone_sender_builder or MicrophoneSenderBuilder()
+        )
         self.lock_port = lock_port
         self.ipc_port = ipc_port
         self._singleton_lock = SingleInstanceLock(port=lock_port)
@@ -199,6 +217,12 @@ class MacBridgeController:
         self._speaker_child_pid: Optional[int] = None
         self._active_peer_address: Optional[str] = None
         self._active_local_bind: Optional[str] = None
+
+        # Microphone path state & desired state
+        self._microphone_desired: bool = False
+        self._microphone_path_state = PathState.IDLE
+        self._microphone_child_pid: Optional[int] = None
+        self._last_actionable_microphone_error: Optional[str] = None
         self._lock = threading.RLock()
 
         # Wire discovery service for HostRole.MACOS
@@ -267,8 +291,24 @@ class MacBridgeController:
             self.reconcile()
             return True
 
+    def set_microphone_enabled(self, enabled: bool) -> bool:
+        """Explicit desired-state control seam for macOS microphone capability."""
+        with self._lock:
+            self._microphone_desired = enabled
+            if not enabled:
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                self._microphone_path_state = PathState.STOPPED
+                self._last_actionable_microphone_error = None
+                return True
+
+            # When enabling microphone, run reconcile
+            self.reconcile()
+            return self._microphone_path_state == PathState.RUNNING
+
     def stop(self) -> bool:
-        """Idempotently stops the speaker pipeline and sets STOPPED_BY_USER."""
+        """Idempotently stops speaker and microphone pipelines and sets STOPPED_BY_USER."""
         with self._lock:
             self._desired_state = DesiredState.STOPPED_BY_USER
             self._persist_desired_state(DesiredState.STOPPED_BY_USER)
@@ -280,6 +320,12 @@ class MacBridgeController:
             self._active_peer_address = None
             self._active_local_bind = None
             self._speaker_path_state = PathState.STOPPED
+
+            # Stop owned microphone pipeline child
+            if self._microphone_child_pid is not None:
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+            self._microphone_path_state = PathState.STOPPED
 
             # Stop discovery
             self.discovery_service.stop()
@@ -297,14 +343,18 @@ class MacBridgeController:
     def get_status(self) -> ControllerStatus:
         """Pure read-only query of controller status without side-effects."""
         with self._lock:
-            owned_count = (
-                1
-                if (
-                    self._speaker_child_pid
-                    and self.process_runner.is_running(self._speaker_child_pid)
-                )
-                else 0
-            )
+            owned_count = 0
+            if (
+                self._speaker_child_pid
+                and self.process_runner.is_running(self._speaker_child_pid)
+            ):
+                owned_count += 1
+            if (
+                self._microphone_child_pid
+                and self.process_runner.is_running(self._microphone_child_pid)
+            ):
+                owned_count += 1
+
             # Check if discovery reported an enumeration error
             last_err = self._last_actionable_error
             disc_err = getattr(self.discovery_service, "last_enumeration_error", None)
@@ -316,6 +366,23 @@ class MacBridgeController:
             if self._speaker_path_state == PathState.RUNNING and self._active_peer_address:
                 peer_addr = self._active_peer_address
                 local_bind = self._active_local_bind
+
+            # Determine honest microphone path state reflection:
+            # - If currently RUNNING, FAILED, UNAVAILABLE, or explicitly STOPPED, keep as-is
+            # - If not running:
+            #   * if STOPPED by user: STOPPED
+            #   * otherwise: IDLE
+            mic_state = self._microphone_path_state
+            if mic_state not in (
+                PathState.RUNNING,
+                PathState.FAILED,
+                PathState.UNAVAILABLE,
+                PathState.STOPPED,
+            ):
+                if self._desired_state == DesiredState.STOPPED_BY_USER:
+                    mic_state = PathState.STOPPED
+                else:
+                    mic_state = PathState.IDLE
 
             return ControllerStatus(
                 controller_state=self._controller_state.value,
@@ -329,6 +396,10 @@ class MacBridgeController:
                 last_actionable_error=last_err,
                 owned_children_count=owned_count,
                 owner_pid=os.getpid() if self._singleton_lock.is_held else None,
+                microphone_path_state=mic_state.value,
+                microphone_port=DEFAULT_MIC_RTP_PORT,
+                pack43_available=None,
+                last_actionable_microphone_error=self._last_actionable_microphone_error,
             )
 
     def reconcile(self) -> None:
@@ -338,15 +409,20 @@ class MacBridgeController:
             if hasattr(self.discovery_service, "refresh_peer_state"):
                 self.discovery_service.refresh_peer_state()
 
+            # 1. Controller STOPPED_BY_USER -> Stop both speaker and microphone
             if self._desired_state == DesiredState.STOPPED_BY_USER:
                 if self._speaker_child_pid is not None:
                     self.process_runner.stop_process(self._speaker_child_pid)
                     self._speaker_child_pid = None
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
                 self._speaker_path_state = PathState.STOPPED
+                self._microphone_path_state = PathState.STOPPED
                 self._controller_state = LifecycleState.STOPPED
                 return
 
-            # Check ambiguity state
+            # 2. Peer Ambiguous -> Stop both speaker and microphone
             if getattr(self.discovery_service, "is_ambiguous", False):
                 self._last_actionable_error = (
                     "Multiple opposite-role responders discovered; manual peer selection required"
@@ -358,15 +434,24 @@ class MacBridgeController:
                     self._active_peer_address = None
                     self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.IDLE
                 return
 
-            # Desired state is ENABLED
+            # 3. GStreamer binary missing -> Fatal error for pipeline
             if not self.pipeline_builder.is_gstreamer_available():
                 self._last_actionable_error = "GStreamer binary not found at configured path"
                 self._controller_state = LifecycleState.ERROR
                 self._speaker_path_state = PathState.FAILED
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.IDLE
                 return
 
+            # 4. Peer Unavailable -> Stop both pipelines, enter DISCOVERING
             if not self.discovery_service.peer_available:
                 self._controller_state = LifecycleState.DISCOVERING
                 self.discovery_service.broadcast_hello()
@@ -380,51 +465,120 @@ class MacBridgeController:
                     self._active_peer_address = None
                     self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.IDLE
                 return
 
-            # Peer is available; resolve CoreAudio built-in speaker output device
-            dev = self.device_resolver.resolve_builtin_speaker_device()
-            if not dev or dev.device_id is None:
-                self._last_actionable_error = "CoreAudio built-in speaker output resolution failed"
-                self._controller_state = LifecycleState.ERROR
-                self._speaker_path_state = PathState.FAILED
-                return
+            # Peer is valid and available: reconcile speaker and microphone independently
+            self._reconcile_speaker()
+            self._reconcile_microphone()
 
-            # Verify if pipeline already running
-            if self._speaker_child_pid and self.process_runner.is_running(self._speaker_child_pid):
-                self._controller_state = LifecycleState.ACTIVE
-                self._speaker_path_state = PathState.RUNNING
-                return
+    def _reconcile_speaker(self) -> None:
+        """Idempotently reconciles the macOS speaker receiver path."""
+        # Resolve CoreAudio built-in speaker output device
+        dev = self.device_resolver.resolve_builtin_speaker_device()
+        if not dev or dev.device_id is None:
+            self._last_actionable_error = "CoreAudio built-in speaker output resolution failed"
+            self._controller_state = LifecycleState.ERROR
+            self._speaker_path_state = PathState.FAILED
+            return
 
-            # Determine local bind address
-            local_bind = self.discovery_service.local_bind_address
-            if not local_bind or local_bind == "0.0.0.0":
-                self._last_actionable_error = "Valid local bind address could not be resolved from peer route"
-                self._controller_state = LifecycleState.ERROR
-                self._speaker_path_state = PathState.FAILED
-                return
+        # Verify if speaker pipeline already running
+        if self._speaker_child_pid and self.process_runner.is_running(self._speaker_child_pid):
+            self._controller_state = LifecycleState.ACTIVE
+            self._speaker_path_state = PathState.RUNNING
+            return
 
-            # Build GStreamer receiver command
-            cmd = self.pipeline_builder.build_receiver_command(
-                local_bind_ip=local_bind,
-                local_port=DEFAULT_SPEAKER_RTP_PORT,
-                device_id=dev.device_id,
+        # Determine local bind address
+        local_bind = self.discovery_service.local_bind_address
+        if not local_bind or local_bind == "0.0.0.0":
+            self._last_actionable_error = "Valid local bind address could not be resolved from peer route"
+            self._controller_state = LifecycleState.ERROR
+            self._speaker_path_state = PathState.FAILED
+            return
+
+        # Build GStreamer receiver command
+        cmd = self.pipeline_builder.build_receiver_command(
+            local_bind_ip=local_bind,
+            local_port=DEFAULT_SPEAKER_RTP_PORT,
+            device_id=dev.device_id,
+        )
+
+        try:
+            pid = self.process_runner.start_process(cmd)
+            self._speaker_child_pid = pid
+            self._active_peer_address = self.discovery_service.peer_address
+            self._active_local_bind = local_bind
+            self._speaker_path_state = PathState.RUNNING
+            self._controller_state = LifecycleState.ACTIVE
+            self._last_actionable_error = None
+        except Exception as exc:
+            self._last_actionable_error = f"Failed to start speaker receiver: {exc}"
+            self._active_peer_address = None
+            self._active_local_bind = None
+            self._speaker_path_state = PathState.FAILED
+            self._controller_state = LifecycleState.ERROR
+
+    def _reconcile_microphone(self) -> None:
+        """Idempotently reconciles the macOS microphone sender path."""
+        if not self._microphone_desired:
+            if self._microphone_child_pid is not None:
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+            if self._desired_state == DesiredState.STOPPED_BY_USER:
+                self._microphone_path_state = PathState.STOPPED
+            else:
+                self._microphone_path_state = PathState.IDLE
+            return
+
+        # Microphone is desired: check if pipeline already running
+        if self._microphone_child_pid is not None:
+            if self.process_runner.is_running(self._microphone_child_pid):
+                self._microphone_path_state = PathState.RUNNING
+                return
+            # Child exited unexpectedly
+            self._microphone_child_pid = None
+
+        # Check GStreamer availability for sender
+        if not self.microphone_sender_builder.is_gstreamer_available():
+            self._last_actionable_microphone_error = (
+                "GStreamer binary not found for microphone sender"
             )
+            self._microphone_path_state = PathState.FAILED
+            return
 
-            try:
-                pid = self.process_runner.start_process(cmd)
-                self._speaker_child_pid = pid
-                self._active_peer_address = self.discovery_service.peer_address
-                self._active_local_bind = local_bind
-                self._speaker_path_state = PathState.RUNNING
-                self._controller_state = LifecycleState.ACTIVE
-                self._last_actionable_error = None
-            except Exception as exc:
-                self._last_actionable_error = f"Failed to start speaker receiver: {exc}"
-                self._active_peer_address = None
-                self._active_local_bind = None
-                self._speaker_path_state = PathState.FAILED
-                self._controller_state = LifecycleState.ERROR
+        # Resolve CoreAudio built-in microphone device
+        dev = self.device_resolver.resolve_builtin_microphone_device()
+        if not dev or dev.device_id is None:
+            self._last_actionable_microphone_error = (
+                "CoreAudio built-in microphone resolution failed"
+            )
+            self._microphone_path_state = PathState.UNAVAILABLE
+            return
+
+        # Determine target host and local bind
+        target_ip = self.discovery_service.peer_address
+        local_bind = self.discovery_service.local_bind_address
+
+        cmd = self.microphone_sender_builder.build_sender_command(
+            target_host=target_ip,
+            target_port=DEFAULT_MIC_RTP_PORT,
+            device_id=dev.device_id,
+            local_bind_ip=local_bind,
+        )
+
+        try:
+            pid = self.process_runner.start_process(cmd)
+            self._microphone_child_pid = pid
+            self._microphone_path_state = PathState.RUNNING
+            self._last_actionable_microphone_error = None
+        except Exception as exc:
+            self._last_actionable_microphone_error = (
+                f"Failed to start microphone sender: {exc}"
+            )
+            self._microphone_path_state = PathState.FAILED
 
     def _on_peer_discovered(self, peer_ip: str, local_ip: str, peer_port: int, peer_inst: str) -> None:
         with self._lock:

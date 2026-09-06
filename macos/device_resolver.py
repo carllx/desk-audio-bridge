@@ -24,7 +24,9 @@ def _fourcc(s: str) -> int:
 kAudioObjectSystemObject = 1
 kAudioHardwarePropertyDevices = _fourcc("dev#")
 kAudioHardwarePropertyDefaultOutputDevice = _fourcc("dOut")
+kAudioHardwarePropertyDefaultInputDevice = _fourcc("dIn ")
 kAudioObjectPropertyScopeGlobal = _fourcc("glob")
+kAudioObjectPropertyScopeInput = _fourcc("inpt")
 kAudioObjectPropertyScopeOutput = _fourcc("outp")
 kAudioObjectPropertyElementMain = 0
 
@@ -50,6 +52,7 @@ class ResolvedAudioDevice(NamedTuple):
     is_builtin: bool
     output_channels: int
     is_default: bool
+    input_channels: int = 0
 
 
 class MacCoreAudioDeviceResolver:
@@ -154,11 +157,68 @@ class MacCoreAudioDeviceResolver:
         except Exception:
             return 0
 
+    def _get_input_channels(self, dev_id: int) -> int:
+        if not self._initialized:
+            return 0
+        addr = AudioObjectPropertyAddress(
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioObjectPropertyScopeInput,
+            kAudioObjectPropertyElementMain,
+        )
+        buf_size = ctypes.c_uint32(0)
+        st = self._coreaudio.AudioObjectGetPropertyDataSize(
+            dev_id, ctypes.byref(addr), 0, None, ctypes.byref(buf_size)
+        )
+        if st != 0 or buf_size.value == 0:
+            return 0
+
+        raw_buf = ctypes.create_string_buffer(buf_size.value)
+        st = self._coreaudio.AudioObjectGetPropertyData(
+            dev_id, ctypes.byref(addr), 0, None, ctypes.byref(buf_size), raw_buf
+        )
+        if st != 0:
+            return 0
+
+        try:
+            num_buffers = struct.unpack_from("<I", raw_buf.raw, 0)[0]
+            total_channels = 0
+            offset = 8
+            for _ in range(num_buffers):
+                if offset + 4 <= buf_size.value:
+                    channels = struct.unpack_from("<I", raw_buf.raw, offset)[0]
+                    total_channels += channels
+                    offset += 16
+            return total_channels
+        except Exception:
+            return 0
+
     def _get_default_output_device_id(self) -> int:
         if not self._initialized:
             return 0
         addr = AudioObjectPropertyAddress(
             kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+        )
+        default_dev = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(default_dev))
+        st = self._coreaudio.AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            ctypes.byref(addr),
+            0,
+            None,
+            ctypes.byref(size),
+            ctypes.byref(default_dev),
+        )
+        if st == 0:
+            return default_dev.value
+        return 0
+
+    def _get_default_input_device_id(self) -> int:
+        if not self._initialized:
+            return 0
+        addr = AudioObjectPropertyAddress(
+            kAudioHardwarePropertyDefaultInputDevice,
             kAudioObjectPropertyScopeGlobal,
             kAudioObjectPropertyElementMain,
         )
@@ -258,3 +318,87 @@ class MacCoreAudioDeviceResolver:
 
         # Priority 3: First available builtin output
         return builtin_outputs[0]
+
+    def enumerate_input_devices(self) -> List[ResolvedAudioDevice]:
+        if not self._initialized:
+            return []
+
+        addr = AudioObjectPropertyAddress(
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+        )
+        size = ctypes.c_uint32(0)
+        st = self._coreaudio.AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject, ctypes.byref(addr), 0, None, ctypes.byref(size)
+        )
+        if st != 0 or size.value == 0:
+            return []
+
+        num_devices = size.value // ctypes.sizeof(ctypes.c_uint32)
+        dev_ids = (ctypes.c_uint32 * num_devices)()
+        st = self._coreaudio.AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            ctypes.byref(addr),
+            0,
+            None,
+            ctypes.byref(size),
+            ctypes.byref(dev_ids),
+        )
+        if st != 0:
+            return []
+
+        default_id = self._get_default_input_device_id()
+        devices = []
+        for dev_id in dev_ids:
+            uid = self._get_string_property(dev_id, kAudioDevicePropertyDeviceUID)
+            name = self._get_string_property(dev_id, kAudioObjectPropertyName)
+            tran = self._get_transport_type(dev_id)
+            channels = self._get_input_channels(dev_id)
+            is_builtin = (tran == kAudioDeviceTransportTypeBuiltIn)
+            is_default = (dev_id == default_id)
+
+            if channels > 0:
+                devices.append(
+                    ResolvedAudioDevice(
+                        device_id=dev_id,
+                        device_uid=uid,
+                        device_name=name,
+                        is_builtin=is_builtin,
+                        output_channels=0,
+                        is_default=is_default,
+                        input_channels=channels,
+                    )
+                )
+        return devices
+
+    def resolve_builtin_microphone_device(self) -> Optional[ResolvedAudioDevice]:
+        """Stably resolves the MacBook built-in microphone input device.
+
+        Priority:
+        1. Built-in transport (`bltn`) + input channels > 0 + name contains microphone keywords
+        2. Built-in transport (`bltn`) + input channels > 0 + is default input device
+        3. Any Built-in transport (`bltn`) with input channels > 0
+
+        Refuses to fallback to non-built-in devices (virtual drivers, AirPods, iPhone Continuity, USB mic, etc.).
+        """
+        all_inputs = self.enumerate_input_devices()
+        builtin_inputs = [d for d in all_inputs if d.is_builtin and d.input_channels > 0]
+        if not builtin_inputs:
+            logger.warning("No built-in input devices found with active input channels")
+            return None
+
+        # Priority 1: Builtin with microphone in name
+        mic_keywords = ("microphone", "麦克风", "mic", "built-in input", "internal mic")
+        for d in builtin_inputs:
+            lower_name = d.device_name.lower()
+            if any(kw in lower_name for kw in mic_keywords):
+                return d
+
+        # Priority 2: Builtin default
+        for d in builtin_inputs:
+            if d.is_default:
+                return d
+
+        # Priority 3: First available builtin input
+        return builtin_inputs[0]
