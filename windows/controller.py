@@ -188,6 +188,8 @@ class WindowsBridgeController:
         self._speaker_path_state = PathState.IDLE
         self._last_actionable_error: Optional[str] = None
         self._speaker_child_pid: Optional[int] = None
+        self._active_peer_address: Optional[str] = None
+        self._active_local_bind: Optional[str] = None
         self._lock = threading.RLock()
 
         # Wire discovery service
@@ -266,6 +268,8 @@ class WindowsBridgeController:
             if self._speaker_child_pid is not None:
                 self.process_runner.stop_process(self._speaker_child_pid)
                 self._speaker_child_pid = None
+            self._active_peer_address = None
+            self._active_local_bind = None
             self._speaker_path_state = PathState.STOPPED
 
             # Stop discovery
@@ -298,13 +302,19 @@ class WindowsBridgeController:
             if not last_err and disc_err:
                 last_err = disc_err
 
+            peer_addr = self.discovery_service.peer_address
+            local_bind = self.discovery_service.local_bind_address
+            if self._speaker_path_state == PathState.RUNNING and self._active_peer_address:
+                peer_addr = self._active_peer_address
+                local_bind = self._active_local_bind
+
             return ControllerStatus(
                 controller_state=self._controller_state.value,
                 desired_state=self._desired_state.value,
                 role=HostRole.WINDOWS.value,
                 peer_available=self.discovery_service.peer_available,
-                peer_address=self.discovery_service.peer_address,
-                local_bind_address=self.discovery_service.local_bind_address,
+                peer_address=peer_addr,
+                local_bind_address=local_bind,
                 speaker_path_state=self._speaker_path_state.value,
                 speaker_target_port=self.discovery_service.peer_speaker_port,
                 last_actionable_error=last_err,
@@ -334,6 +344,8 @@ class WindowsBridgeController:
                 if self._speaker_child_pid is not None:
                     self.process_runner.stop_process(self._speaker_child_pid)
                     self._speaker_child_pid = None
+                    self._active_peer_address = None
+                    self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
                 return
 
@@ -354,6 +366,8 @@ class WindowsBridgeController:
                 if self._speaker_child_pid is not None:
                     self.process_runner.stop_process(self._speaker_child_pid)
                     self._speaker_child_pid = None
+                    self._active_peer_address = None
+                    self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
                 return
 
@@ -385,11 +399,15 @@ class WindowsBridgeController:
             try:
                 pid = self.process_runner.start_process(cmd)
                 self._speaker_child_pid = pid
+                self._active_peer_address = target_ip
+                self._active_local_bind = local_bind
                 self._speaker_path_state = PathState.RUNNING
                 self._controller_state = LifecycleState.ACTIVE
                 self._last_actionable_error = None
             except Exception as exc:
                 self._last_actionable_error = f"Failed to start speaker pipeline: {exc}"
+                self._active_peer_address = None
+                self._active_local_bind = None
                 self._speaker_path_state = PathState.FAILED
                 self._controller_state = LifecycleState.ERROR
 

@@ -381,11 +381,17 @@ class PeerDiscoveryService:
                 and self._peer_address is not None
                 and not self._is_ambiguous
             )
-            self._peer_address = peer_ip
-            self._local_bind_address = local_source_ip
-            self._peer_instance_id = peer_inst
-            self._peer_speaker_port = peer_spk_port
-            self._last_peer_seen = now
+            # If we are already stably paired with this instance on an active route, keep the active route
+            if was_avail and self._peer_instance_id == peer_inst and self._peer_address != peer_ip:
+                # Update timestamp for liveness on current route, but do not flap IP
+                self._last_peer_seen = now
+                self._peer_speaker_port = peer_spk_port
+            else:
+                self._peer_address = peer_ip
+                self._local_bind_address = local_source_ip
+                self._peer_instance_id = peer_inst
+                self._peer_speaker_port = peer_spk_port
+                self._last_peer_seen = now
 
         if not was_avail and self.on_peer_discovered:
             self.on_peer_discovered(peer_ip, local_source_ip, peer_spk_port, peer_inst)

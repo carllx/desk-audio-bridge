@@ -498,3 +498,80 @@ def test_cross_process_ipc_lifecycle(temp_state_file):
     assert res_status2["owned_children_count"] == 0
 
     controller.shutdown()
+
+
+# ---------------------------------------------------------
+# Test Suite 7: Route Drift Prevention on Multi-Homed Host
+# ---------------------------------------------------------
+
+def test_route_drift_prevention_on_multi_interface(temp_state_file):
+    """Verifies that packets for the same peer instance arriving from a second interface
+    do not cause route drift between controller get_status() and the running GStreamer process.
+    """
+    direct_local_ip = "198.168.10.5"
+    wifi_local_ip = "192.168.10.10"
+    mac_direct_ip = "198.168.10.4"
+    mac_wifi_ip = "192.168.10.70"
+
+    routes = {
+        mac_direct_ip: direct_local_ip,
+        mac_wifi_ip: wifi_local_ip,
+    }
+    resolver = MockRouteResolver(routes)
+
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.WINDOWS,
+        instance_id="win-drift-test",
+        control_port=50190,
+        route_resolver=resolver,
+    )
+
+    runner = FakeProcessRunner()
+    builder = FakePipelineBuilder()
+    controller = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=builder,
+        discovery_service=discovery,
+        lock_port=50191,
+        ipc_port=50192,
+    )
+    assert controller.start() is True
+
+    # 1. First packet arrives on Direct Link
+    peer_msg = {
+        "version": 1,
+        "role": "macos",
+        "instance_id": "mac-shared-instance-123",
+        "speaker_port": 5004,
+    }
+    discovery.handle_peer_message(peer_msg, mac_direct_ip)
+    controller.reconcile()
+
+    # Verify pipeline started with Direct Link route
+    status = controller.get_status()
+    assert status.speaker_path_state == PathState.RUNNING.value
+    assert status.peer_address == mac_direct_ip
+    assert status.local_bind_address == direct_local_ip
+    assert builder.last_built_cmd is not None
+    assert f"--host={mac_direct_ip}" in builder.last_built_cmd
+    assert f"--bind={direct_local_ip}" in builder.last_built_cmd
+    initial_running_pid = list(runner.running_pids)[0]
+
+    # 2. Second packet for SAME instance arrives on Wi-Fi interface
+    discovery.handle_peer_message(peer_msg, mac_wifi_ip)
+    controller.reconcile()
+
+    # Verify NO route drift: Status STILL reports active data-path route, and pipeline was NOT flapped
+    status2 = controller.get_status()
+    assert status2.speaker_path_state == PathState.RUNNING.value
+    assert status2.peer_address == mac_direct_ip
+    assert status2.local_bind_address == direct_local_ip
+    assert status2.peer_address != mac_wifi_ip
+    assert status2.local_bind_address != wifi_local_ip
+    # Pipeline process did not restart
+    assert list(runner.running_pids) == [initial_running_pid]
+
+    controller.shutdown()
+
