@@ -18,7 +18,7 @@ DEFAULT_MIC_RTP_PORT = 5006
 DEFAULT_LOCAL_IPC_PORT = 50106
 DEFAULT_SINGLETON_PORT = 50105
 
-# RTP L16 canonical audio parameters - Speaker
+# RTP L16 canonical audio parameters
 CANONICAL_SAMPLE_RATE = 48000
 CANONICAL_CHANNELS = 2
 CANONICAL_PAYLOAD_TYPE = 96
@@ -53,6 +53,7 @@ class LifecycleState(str, Enum):
 
 class PathState(str, Enum):
     IDLE = "IDLE"
+    READY = "READY"
     STARTING = "STARTING"
     RUNNING = "RUNNING"
     STOPPED = "STOPPED"
@@ -100,9 +101,8 @@ class ControllerStatus:
     owner_pid: Optional[int] = None
     microphone_path_state: str = PathState.IDLE.value
     microphone_port: int = DEFAULT_MIC_RTP_PORT
-    pack43_available: bool = False
+    pack43_available: Optional[bool] = None
     last_actionable_microphone_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
-

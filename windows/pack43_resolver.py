@@ -39,7 +39,7 @@ class Pack43Resolver:
     def __init__(self, pwsh_path: Optional[str] = None):
         self._pwsh_path = pwsh_path
         self._cached_result: Optional[Pack43ResolutionResult] = None
-        self._is_stale: bool = True
+        self._has_cached: bool = False
 
     def _get_powershell_executable(self) -> Optional[str]:
         if self._pwsh_path and os.path.exists(self._pwsh_path):
@@ -55,26 +55,42 @@ class Pack43Resolver:
 
     def invalidate_cache(self) -> None:
         """Explicitly marks cached resolution as stale, forcing re-enumeration on next request."""
-        self._is_stale = True
+        self._has_cached = False
         self._cached_result = None
 
     @property
-    def is_cached_available(self) -> bool:
-        """Read-only check if a valid resolution is currently cached without triggering CIM."""
-        return self._cached_result is not None and not self._is_stale
+    def has_probed(self) -> bool:
+        """Read-only check if Pack43 has been probed at least once since start or last invalidation."""
+        return self._has_cached
+
+    @property
+    def is_cached_available(self) -> Optional[bool]:
+        """Read-only tri-state check of Pack43 availability without triggering CIM/WMI:
+
+        Returns:
+          True  -> Probed and confirmed available.
+          False -> Probed and confirmed unavailable / mismatched.
+          None  -> Not probed yet (fresh / unprobed state).
+        """
+        if not self._has_cached:
+            return None
+        return self._cached_result is not None
 
     def resolve_pack43(self, force_refresh: bool = False) -> Optional[Pack43ResolutionResult]:
         """Resolves Pack43 render endpoint and validates driver identity.
 
-        Uses cached result if available and fresh, unless force_refresh is True.
+        Uses cached result (including negative/unavailable result) if available and fresh,
+        unless force_refresh is True.
         Returns Pack43ResolutionResult if found and valid; returns None (fail-closed) otherwise.
         """
-        if not force_refresh and not self._is_stale and self._cached_result is not None:
+        if not force_refresh and self._has_cached:
             return self._cached_result
 
         pwsh = self._get_powershell_executable()
         if not pwsh:
             logger.warning("PowerShell executable not found for Pack43 enumeration")
+            self._cached_result = None
+            self._has_cached = True
             return None
 
         # Query driver and render endpoint via a single lightweight PowerShell script
@@ -109,22 +125,28 @@ class Pack43Resolver:
             if res.returncode != 0:
                 logger.debug("Pack43 enumeration failed with returncode %d: %s", res.returncode, res.stderr.strip())
                 self._cached_result = None
-                self._is_stale = False
+                self._has_cached = True
                 return None
 
             stdout = res.stdout.strip()
             parts = stdout.split(";;;")
             if len(parts) != 4:
                 logger.warning("Unexpected Pack43 enumeration output: %s", stdout)
+                self._cached_result = None
+                self._has_cached = True
                 return None
 
             manufacturer, driver_ver, render_dev_id, cap_dev_id = parts
             if PACK43_EXPECTED_MANUFACTURER.lower() not in manufacturer.lower():
                 logger.warning("Pack43 manufacturer mismatch: got %s, expected %s", manufacturer, PACK43_EXPECTED_MANUFACTURER)
+                self._cached_result = None
+                self._has_cached = True
                 return None
 
             if driver_ver.strip() != PACK43_EXPECTED_DRIVER_VERSION:
                 logger.warning("Pack43 driver version mismatch: got %s, expected %s", driver_ver, PACK43_EXPECTED_DRIVER_VERSION)
+                self._cached_result = None
+                self._has_cached = True
                 return None
 
             render_endpoint_id = render_dev_id
@@ -137,11 +159,11 @@ class Pack43Resolver:
                 driver_version=driver_ver.strip(),
             )
             self._cached_result = result
-            self._is_stale = False
+            self._has_cached = True
             return result
 
         except Exception as exc:
             logger.error("Exception during Pack43 enumeration: %s", exc)
             self._cached_result = None
-            self._is_stale = False
+            self._has_cached = True
             return None

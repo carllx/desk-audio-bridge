@@ -347,8 +347,26 @@ class WindowsBridgeController:
                 peer_addr = self._active_peer_address
                 local_bind = self._active_local_bind
 
-            # Pack43 availability is inspected purely from cache to avoid expensive WMI queries in status
+            # Pack43 availability: tri-state without triggering CIM/WMI (True / False / None)
             pack43_avail = self.pack43_resolver.is_cached_available
+
+            # Determine honest microphone path state reflection:
+            # - If currently RUNNING, FAILED, UNAVAILABLE, or explicitly STOPPED, keep as-is
+            # - If not running:
+            #   * if STOPPED by user: STOPPED
+            #   * if Pack43 is cached available: READY
+            #   * if Pack43 is cached unavailable: UNAVAILABLE
+            #   * otherwise: IDLE
+            mic_state = self._microphone_path_state
+            if mic_state not in (PathState.RUNNING, PathState.FAILED, PathState.UNAVAILABLE, PathState.STOPPED):
+                if self._desired_state == DesiredState.STOPPED_BY_USER:
+                    mic_state = PathState.STOPPED
+                elif pack43_avail is True:
+                    mic_state = PathState.READY
+                elif pack43_avail is False:
+                    mic_state = PathState.UNAVAILABLE
+                else:
+                    mic_state = PathState.IDLE
 
             return ControllerStatus(
                 controller_state=self._controller_state.value,
@@ -362,7 +380,7 @@ class WindowsBridgeController:
                 last_actionable_error=last_err,
                 owned_children_count=owned_count,
                 owner_pid=os.getpid() if self._singleton_lock.is_held else None,
-                microphone_path_state=self._microphone_path_state.value,
+                microphone_path_state=mic_state.value,
                 microphone_port=DEFAULT_MIC_RTP_PORT,
                 pack43_available=pack43_avail,
                 last_actionable_microphone_error=self._last_actionable_microphone_error,
@@ -375,6 +393,7 @@ class WindowsBridgeController:
             if hasattr(self.discovery_service, "refresh_peer_state"):
                 self.discovery_service.refresh_peer_state()
 
+            # 1. Controller STOPPED_BY_USER -> Stop both speaker and microphone
             if self._desired_state == DesiredState.STOPPED_BY_USER:
                 if self._speaker_child_pid is not None:
                     self.process_runner.stop_process(self._speaker_child_pid)
@@ -387,7 +406,7 @@ class WindowsBridgeController:
                 self._controller_state = LifecycleState.STOPPED
                 return
 
-            # Check ambiguity state
+            # 2. Peer Ambiguous -> Stop both speaker and microphone
             if getattr(self.discovery_service, "is_ambiguous", False):
                 self._last_actionable_error = "Multiple opposite-role responders discovered; manual peer selection required"
                 self._controller_state = LifecycleState.AMBIGUOUS_PEER
@@ -397,15 +416,24 @@ class WindowsBridgeController:
                     self._active_peer_address = None
                     self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.IDLE
                 return
 
-            # Desired state is ENABLED
+            # 3. GStreamer binary missing -> Fatal error for pipeline
             if not self.pipeline_builder.is_gstreamer_available():
                 self._last_actionable_error = "GStreamer binary not found at configured path"
                 self._controller_state = LifecycleState.ERROR
                 self._speaker_path_state = PathState.FAILED
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.IDLE
                 return
 
+            # 4. Peer Unavailable -> Stop both pipelines, enter DISCOVERING
             if not self.discovery_service.peer_available:
                 self._controller_state = LifecycleState.DISCOVERING
                 self.discovery_service.broadcast_hello()
@@ -419,49 +447,57 @@ class WindowsBridgeController:
                     self._active_peer_address = None
                     self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
+                if self._microphone_child_pid is not None:
+                    self.process_runner.stop_process(self._microphone_child_pid)
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.IDLE
                 return
 
-            # Peer is available; resolve playback endpoint for speaker
-            endpoint_id = self.device_resolver.resolve_default_playback_endpoint_id()
-            if not endpoint_id:
-                self._last_actionable_error = "Windows Playback Source endpoint resolution failed"
-                self._controller_state = LifecycleState.ERROR
-                self._speaker_path_state = PathState.FAILED
-                return
-
-            # Verify if speaker pipeline already running
-            if self._speaker_child_pid and self.process_runner.is_running(self._speaker_child_pid):
-                self._controller_state = LifecycleState.ACTIVE
-                self._speaker_path_state = PathState.RUNNING
-            else:
-                # Create speaker pipeline child
-                target_ip = self.discovery_service.peer_address
-                target_port = self.discovery_service.peer_speaker_port
-                local_bind = self.discovery_service.local_bind_address
-                cmd = self.pipeline_builder.build_sender_command(
-                    target_host=target_ip,
-                    target_port=target_port,
-                    device_id=endpoint_id,
-                    local_bind_ip=local_bind,
-                )
-
-                try:
-                    pid = self.process_runner.start_process(cmd)
-                    self._speaker_child_pid = pid
-                    self._active_peer_address = target_ip
-                    self._active_local_bind = local_bind
-                    self._speaker_path_state = PathState.RUNNING
-                    self._controller_state = LifecycleState.ACTIVE
-                    self._last_actionable_error = None
-                except Exception as exc:
-                    self._last_actionable_error = f"Failed to start speaker pipeline: {exc}"
-                    self._active_peer_address = None
-                    self._active_local_bind = None
-                    self._speaker_path_state = PathState.FAILED
-                    self._controller_state = LifecycleState.ERROR
-
-            # Independent Microphone Path Reconcile
+            # Peer is valid and available: reconcile speaker and microphone independently
+            self._reconcile_speaker()
             self._reconcile_microphone()
+
+    def _reconcile_speaker(self) -> None:
+        """Idempotently reconciles the Windows speaker sender path."""
+        # Resolve playback endpoint for speaker
+        endpoint_id = self.device_resolver.resolve_default_playback_endpoint_id()
+        if not endpoint_id:
+            self._last_actionable_error = "Windows Playback Source endpoint resolution failed"
+            self._controller_state = LifecycleState.ERROR
+            self._speaker_path_state = PathState.FAILED
+            return
+
+        # Verify if speaker pipeline already running
+        if self._speaker_child_pid and self.process_runner.is_running(self._speaker_child_pid):
+            self._controller_state = LifecycleState.ACTIVE
+            self._speaker_path_state = PathState.RUNNING
+            return
+
+        # Create speaker pipeline child
+        target_ip = self.discovery_service.peer_address
+        target_port = self.discovery_service.peer_speaker_port
+        local_bind = self.discovery_service.local_bind_address
+        cmd = self.pipeline_builder.build_sender_command(
+            target_host=target_ip,
+            target_port=target_port,
+            device_id=endpoint_id,
+            local_bind_ip=local_bind,
+        )
+
+        try:
+            pid = self.process_runner.start_process(cmd)
+            self._speaker_child_pid = pid
+            self._active_peer_address = target_ip
+            self._active_local_bind = local_bind
+            self._speaker_path_state = PathState.RUNNING
+            self._controller_state = LifecycleState.ACTIVE
+            self._last_actionable_error = None
+        except Exception as exc:
+            self._last_actionable_error = f"Failed to start speaker pipeline: {exc}"
+            self._active_peer_address = None
+            self._active_local_bind = None
+            self._speaker_path_state = PathState.FAILED
+            self._controller_state = LifecycleState.ERROR
 
     def _reconcile_microphone(self) -> None:
         """Idempotently reconciles the Windows microphone receiver path."""
@@ -469,7 +505,10 @@ class WindowsBridgeController:
             if self._microphone_child_pid is not None:
                 self.process_runner.stop_process(self._microphone_child_pid)
                 self._microphone_child_pid = None
-            self._microphone_path_state = PathState.STOPPED if self._desired_state == DesiredState.STOPPED_BY_USER else PathState.IDLE
+            if self._desired_state == DesiredState.STOPPED_BY_USER:
+                self._microphone_path_state = PathState.STOPPED
+            else:
+                self._microphone_path_state = PathState.READY if self.pack43_resolver.is_cached_available is True else PathState.IDLE
             return
 
         # Microphone is desired: check if pipeline already running

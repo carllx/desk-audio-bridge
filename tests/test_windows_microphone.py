@@ -63,15 +63,17 @@ class FakePack43Resolver(Pack43Resolver):
         self.should_succeed = should_succeed
         self.render_id = render_id
         self.resolve_call_count = 0
+        self.underlying_enumeration_count = 0
 
     def resolve_pack43(self, force_refresh: bool = False) -> Optional[Pack43ResolutionResult]:
         self.resolve_call_count += 1
-        if not force_refresh and not self._is_stale and self._cached_result is not None:
+        if not force_refresh and self._has_cached:
             return self._cached_result
 
+        self.underlying_enumeration_count += 1
         if not self.should_succeed:
             self._cached_result = None
-            self._is_stale = False
+            self._has_cached = True
             return None
 
         res = Pack43ResolutionResult(
@@ -80,7 +82,7 @@ class FakePack43Resolver(Pack43Resolver):
             driver_version="1.0.3.5",
         )
         self._cached_result = res
-        self._is_stale = False
+        self._has_cached = True
         return res
 
 
@@ -149,26 +151,65 @@ def test_microphone_receiver_builder_canonical_command():
 
 def test_pack43_resolver_cache_hit_and_invalidation():
     resolver = FakePack43Resolver(should_succeed=True)
-    assert not resolver.is_cached_available
+    assert resolver.is_cached_available is None
 
     res1 = resolver.resolve_pack43()
     assert res1 is not None
     assert resolver.resolve_call_count == 1
-    assert resolver.is_cached_available
+    assert resolver.underlying_enumeration_count == 1
+    assert resolver.is_cached_available is True
 
-    # Second call hits cache
+    # Second call hits cache (underlying enumeration count remains 1)
     res2 = resolver.resolve_pack43()
     assert res2 == res1
     assert resolver.resolve_call_count == 2
-    # In fake resolver, resolve_call_count increments but underlying work is skipped via cache check
-    assert resolver.is_cached_available
+    assert resolver.underlying_enumeration_count == 1
+    assert resolver.is_cached_available is True
 
-    # Invalidate cache
+    # Invalidate cache -> next call re-enumerates
     resolver.invalidate_cache()
-    assert not resolver.is_cached_available
+    assert resolver.is_cached_available is None
     res3 = resolver.resolve_pack43()
     assert res3 is not None
-    assert resolver.is_cached_available
+    assert resolver.resolve_call_count == 3
+    assert resolver.underlying_enumeration_count == 2
+    assert resolver.is_cached_available is True
+
+
+def test_repeated_unavailable_resolve_does_not_enumerate_again_until_invalidate():
+    """Verifies that known-negative Pack43 resolution result is cached and does not re-enumerate."""
+    resolver = FakePack43Resolver(should_succeed=False)
+    assert resolver.is_cached_available is None
+
+    # First resolve: fails and records negative result in cache
+    res1 = resolver.resolve_pack43()
+    assert res1 is None
+    assert resolver.resolve_call_count == 1
+    assert resolver.underlying_enumeration_count == 1
+    assert resolver.is_cached_available is False
+
+    # Second resolve: hits negative cache, does NOT re-enumerate
+    res2 = resolver.resolve_pack43()
+    assert res2 is None
+    assert resolver.resolve_call_count == 2
+    assert resolver.underlying_enumeration_count == 1
+    assert resolver.is_cached_available is False
+
+    # Third resolve: still cached None
+    res3 = resolver.resolve_pack43()
+    assert res3 is None
+    assert resolver.resolve_call_count == 3
+    assert resolver.underlying_enumeration_count == 1
+    assert resolver.is_cached_available is False
+
+    # Invalidate cache -> next resolve triggers underlying enumeration
+    resolver.invalidate_cache()
+    assert resolver.is_cached_available is None
+    res4 = resolver.resolve_pack43()
+    assert res4 is None
+    assert resolver.resolve_call_count == 4
+    assert resolver.underlying_enumeration_count == 2
+    assert resolver.is_cached_available is False
 
 
 def test_microphone_not_started_automatically_with_speaker(temp_state_file):
@@ -354,3 +395,106 @@ def test_controller_stop_cleans_both_children_without_affecting_others(temp_stat
     assert ctrl.get_status().owned_children_count == 0
     assert ctrl.get_status().microphone_path_state == PathState.STOPPED.value
     assert ctrl.get_status().speaker_path_state == PathState.STOPPED.value
+
+
+def test_active_microphone_stops_when_peer_becomes_unavailable(temp_state_file):
+    """Verifies that active microphone receiver child is stopped when peer is lost."""
+    runner = FakeProcessRunner()
+    pack43 = FakePack43Resolver(should_succeed=True)
+    disc = FakeDiscoveryService()
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        discovery_service=disc,
+        pack43_resolver=pack43,
+        lock_port=50173,
+        ipc_port=50174,
+    )
+
+    ctrl.start()
+    ctrl.set_microphone_enabled(True)
+    assert ctrl.get_status().owned_children_count == 2
+    assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
+    mic_pid = ctrl._microphone_child_pid
+    spk_pid = ctrl._speaker_child_pid
+
+    # Peer becomes unavailable
+    disc.peer_available = False
+    ctrl.reconcile()
+
+    # Both speaker and microphone children must be terminated
+    assert mic_pid in runner.stopped_pids
+    assert spk_pid in runner.stopped_pids
+    assert ctrl.get_status().owned_children_count == 0
+    assert ctrl.get_status().microphone_path_state == PathState.READY.value
+    assert ctrl.get_status().speaker_path_state == PathState.IDLE.value
+
+
+def test_active_microphone_stops_when_peer_becomes_ambiguous(temp_state_file):
+    """Verifies that active microphone receiver child is stopped when peer state becomes ambiguous."""
+    runner = FakeProcessRunner()
+    pack43 = FakePack43Resolver(should_succeed=True)
+    disc = FakeDiscoveryService()
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        discovery_service=disc,
+        pack43_resolver=pack43,
+        lock_port=50175,
+        ipc_port=50176,
+    )
+
+    ctrl.start()
+    ctrl.set_microphone_enabled(True)
+    assert ctrl.get_status().owned_children_count == 2
+    assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
+    mic_pid = ctrl._microphone_child_pid
+    spk_pid = ctrl._speaker_child_pid
+
+    # Ambiguity detected
+    disc.is_ambiguous = True
+    ctrl.reconcile()
+
+    # Both speaker and microphone children must be terminated
+    assert mic_pid in runner.stopped_pids
+    assert spk_pid in runner.stopped_pids
+    assert ctrl.get_status().owned_children_count == 0
+    assert ctrl.get_status().microphone_path_state == PathState.READY.value
+    assert ctrl.get_status().speaker_path_state == PathState.IDLE.value
+
+
+def test_speaker_endpoint_failure_does_not_prevent_requested_microphone_path(temp_state_file):
+    """Verifies that playback endpoint resolution failure does NOT block microphone capability reconcile."""
+    runner = FakeProcessRunner()
+    pack43 = FakePack43Resolver(should_succeed=True)
+    disc = FakeDiscoveryService()
+
+    class FailingDeviceResolver:
+        def resolve_default_playback_endpoint_id(self) -> Optional[str]:
+            return None
+
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FailingDeviceResolver(),
+        discovery_service=disc,
+        pack43_resolver=pack43,
+        lock_port=50177,
+        ipc_port=50178,
+    )
+
+    ctrl.start()
+    # Speaker fails due to endpoint resolution
+    assert ctrl.get_status().speaker_path_state == PathState.FAILED.value
+
+    # Enabling microphone should succeed despite speaker endpoint failure
+    success = ctrl.set_microphone_enabled(True)
+    assert success is True
+    status = ctrl.get_status()
+    assert status.microphone_path_state == PathState.RUNNING.value
+    assert status.speaker_path_state == PathState.FAILED.value
+    assert status.owned_children_count == 1
+    assert len(runner.started_commands) == 1
+    assert "wasapisink" in runner.started_commands[0]
