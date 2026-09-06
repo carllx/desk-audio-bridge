@@ -10,11 +10,17 @@ Maps stable identity to runtime AudioDeviceID without hardcoding temporary integ
 """
 
 import ctypes
+import json
 import logging
+import os
 import struct
 from typing import List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MIC_UID_HINT_FILE = os.path.expanduser(
+    "~/Library/Application Support/desk-audio-bridge/microphone_uid_hint.json"
+)
 
 # FourCC helper
 def _fourcc(s: str) -> int:
@@ -58,7 +64,8 @@ class ResolvedAudioDevice(NamedTuple):
 class MacCoreAudioDeviceResolver:
     """Resolves the macOS built-in speakers endpoint dynamically via CoreAudio C API."""
 
-    def __init__(self):
+    def __init__(self, mic_hint_file: Optional[str] = None):
+        self.mic_hint_file = mic_hint_file or DEFAULT_MIC_UID_HINT_FILE
         try:
             self._coreaudio = ctypes.cdll.LoadLibrary(
                 "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
@@ -372,33 +379,84 @@ class MacCoreAudioDeviceResolver:
                 )
         return devices
 
+    def _load_mic_uid_hint(self) -> Optional[str]:
+        """读取本地缓存的麦克风 CoreAudio Device UID 提示。"""
+        if not self.mic_hint_file or not os.path.exists(self.mic_hint_file):
+            return None
+        try:
+            with open(self.mic_hint_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                uid = data.get("microphone_uid")
+                if isinstance(uid, str) and uid.strip():
+                    return uid.strip()
+        except Exception as exc:
+            logger.debug("读取麦克风 UID 提示失败: %s", exc)
+        return None
+
+    def _persist_mic_uid_hint(self, uid: str) -> None:
+        """持久化麦克风 CoreAudio Device UID 提示到本地（绝不记录临时 DeviceID）。"""
+        clean_uid = uid.strip() if isinstance(uid, str) else ""
+        if not self.mic_hint_file or not clean_uid:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.mic_hint_file), exist_ok=True)
+            with open(self.mic_hint_file, "w", encoding="utf-8") as f:
+                json.dump({"microphone_uid": clean_uid}, f)
+        except Exception as exc:
+            logger.warning("持久化麦克风 UID 提示失败: %s", exc)
+
     def resolve_builtin_microphone_device(self) -> Optional[ResolvedAudioDevice]:
-        """Stably resolves the MacBook built-in microphone input device.
+        """稳定解析 MacBook 内置麦克风输入设备。
 
-        Priority:
-        1. Built-in transport (`bltn`) + input channels > 0 + name contains microphone keywords
-        2. Built-in transport (`bltn`) + input channels > 0 + is default input device
-        3. Any Built-in transport (`bltn`) with input channels > 0
-
-        Refuses to fallback to non-built-in devices (virtual drivers, AirPods, iPhone Continuity, USB mic, etc.).
+        解析与身份定位流程：
+        1. 枚举当前 CoreAudio 输入设备；
+        2. 过滤有效内置候选：transport 为内置 (bltn)、输入通道数 > 0 且拥有非空稳定 Device UID；
+        3. 若本地存在缓存的 UID hint 且命中当前有效候选，直接返回其当前运行时 AudioDeviceID；
+        4. 若缓存 UID 过期或不存在：在有效内置设备中执行匹配（名称关键字 -> 默认设备 -> 首个设备），
+           将其非空 Device UID 作为新 hint 持久化并返回其当前运行时 AudioDeviceID；
+        5. 若无任何有效内置麦克风设备，返回 None（严格 fail-closed，绝不回退至非内置设备）。
         """
         all_inputs = self.enumerate_input_devices()
-        builtin_inputs = [d for d in all_inputs if d.is_builtin and d.input_channels > 0]
+        builtin_inputs = [
+            d
+            for d in all_inputs
+            if d.is_builtin and d.input_channels > 0 and d.device_uid and d.device_uid.strip()
+        ]
         if not builtin_inputs:
-            logger.warning("No built-in input devices found with active input channels")
+            logger.warning("未发现具备有效输入通道及非空 UID 的内置输入设备")
             return None
 
-        # Priority 1: Builtin with microphone in name
+        # 检查本地缓存的 UID hint 是否命中当前有效内置麦克风
+        cached_uid = self._load_mic_uid_hint()
+        if cached_uid:
+            for d in builtin_inputs:
+                if d.device_uid == cached_uid:
+                    return d
+            logger.debug("缓存的麦克风 UID %s 已失效或未匹配到当前设备", cached_uid)
+
+        # 缓存缺失或失效：在有效候选设备中进行重新发现
+        selected: Optional[ResolvedAudioDevice] = None
         mic_keywords = ("microphone", "麦克风", "mic", "built-in input", "internal mic")
         for d in builtin_inputs:
             lower_name = d.device_name.lower()
             if any(kw in lower_name for kw in mic_keywords):
-                return d
+                selected = d
+                break
 
-        # Priority 2: Builtin default
-        for d in builtin_inputs:
-            if d.is_default:
-                return d
+        # 降级尝试：系统默认输入设备
+        if not selected:
+            for d in builtin_inputs:
+                if d.is_default:
+                    selected = d
+                    break
 
-        # Priority 3: First available builtin input
-        return builtin_inputs[0]
+        # 降级尝试：首个可用内置输入设备
+        if not selected:
+            selected = builtin_inputs[0]
+
+        # 必须存在有效非空 Device UID 才能作为稳定设备返回
+        if selected and selected.device_uid and selected.device_uid.strip():
+            self._persist_mic_uid_hint(selected.device_uid.strip())
+            return selected
+
+        return None
