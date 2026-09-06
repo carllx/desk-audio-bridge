@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import pytest
 
 from bridge_core.contract import (
@@ -1038,6 +1038,231 @@ def test_classifier_failure_safe_fallback():
     time.sleep(0.12)
     assert discovery.peer_available is True
     assert discovery.peer_address == WF_ETHERNET_PEER_IP
+
+
+# ---------------------------------------------------------
+# Test Suite 10: Issue #30 Steady-State Control Heartbeat & Route Stability
+# ---------------------------------------------------------
+
+class MockTimeProvider:
+    def __init__(self, start_time: float = 1000.0):
+        self.current_time = start_time
+
+    def time(self) -> float:
+        return self.current_time
+
+    def advance(self, seconds: float):
+        self.current_time += seconds
+
+
+class CountingEnumerator(InterfaceEnumerator):
+    def __init__(self, candidates: List[Tuple[str, str]]):
+        self.candidates = candidates
+        self.call_count = 0
+
+    def get_candidate_interfaces(self) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
+        self.call_count += 1
+        return True, self.candidates, None
+
+
+def test_heartbeat_survives_past_15_seconds(monkeypatch):
+    """Test 1: Healthy steady-state heartbeat maintains peer_available past 15s without expiry.
+    
+    Uses logical time advancement (mocked time.time), verifying:
+    - periodic refresh_peer_state broadcasts HELLO at heartbeat interval (~4s).
+    - peer_available stays True over 30s of elapsed logical time.
+    - responder is not pruned.
+    """
+    time_mock = MockTimeProvider(1000.0)
+    monkeypatch.setattr(time, "time", time_mock.time)
+
+    enumerator = CountingEnumerator([("198.168.10.4", "198.168.10.255")])
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.MACOS,
+        instance_id="mac-heartbeat-1",
+        control_port=50350,
+        interface_enumerator=enumerator,
+        election_delay=0.0,
+        heartbeat_interval=4.0,
+    )
+    # Put service in running state without opening real UDP socket
+    discovery._running = True
+
+    # Peer initial arrival at t=1000.0
+    peer_msg = {
+        "version": 1,
+        "role": "windows",
+        "instance_id": "win-peer-steady",
+        "speaker_port": 5004,
+    }
+    discovery.handle_peer_message(peer_msg, "198.168.10.5")
+    assert discovery.peer_available is True
+    assert discovery.peer_address == "198.168.10.5"
+
+    # Simulate 30 seconds of running time (steps of 1s reconcile tick)
+    for _ in range(30):
+        time_mock.advance(1.0)
+        # Advance peer state
+        discovery.refresh_peer_state()
+        # Simulate peer responding to heartbeat or sending its own periodic heartbeat
+        # within each interval
+        discovery.handle_peer_message(peer_msg, "198.168.10.5")
+
+        assert discovery.peer_available is True
+        assert discovery.peer_address == "198.168.10.5"
+
+    # Verify enumerator was invoked periodically for heartbeats (> 5 times in 30s)
+    assert enumerator.call_count >= 6
+    assert "win-peer-steady" in discovery._known_responders
+
+
+def test_heartbeat_arrival_causes_no_route_or_media_flap(temp_state_file):
+    """Test 2: Heartbeat packets do NOT flap wired route or restart controller media child processes.
+    
+    Verifies:
+    - Active wired route does not drift to Wi-Fi.
+    - on_peer_discovered callback is NOT repeatedly invoked for routine steady-state heartbeats.
+    - speaker_child_pid remains identical across multiple reconcile/heartbeat cycles.
+    """
+    resolver = DictRouteResolver(WF_ROUTES)
+    classifier = FakeClassifier(WF_MEDIUM_MAP)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.WINDOWS,
+        instance_id="win-ctrl-steady",
+        control_port=50352,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+        election_delay=0.0,
+        heartbeat_interval=4.0,
+    )
+    runner = FakeProcessRunner()
+    builder = FakePipelineBuilder()
+    controller = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=builder,
+        discovery_service=discovery,
+        lock_port=50353,
+        ipc_port=50354,
+    )
+
+    discovered_callbacks = []
+    def recording_on_peer_discovered(*args):
+        discovered_callbacks.append(args)
+        controller._on_peer_discovered(*args)
+
+    discovery.on_peer_discovered = recording_on_peer_discovered
+    assert controller.start() is True
+
+    peer_msg = {
+        "version": 1,
+        "role": "macos",
+        "instance_id": "mac-peer-steady",
+        "speaker_port": 5004,
+    }
+
+    # Initial connection on Ethernet
+    discovery.handle_peer_message(peer_msg, WF_ETHERNET_PEER_IP)
+    controller.reconcile()
+
+    status1 = controller.get_status()
+    assert status1.speaker_path_state == PathState.RUNNING.value
+    assert status1.peer_address == WF_ETHERNET_PEER_IP
+    assert status1.local_bind_address == WF_ETHERNET_LOCAL_IP
+    initial_pid = controller._speaker_child_pid
+    assert initial_pid is not None
+    assert len(discovered_callbacks) == 1
+
+    # Simulate 5 subsequent steady-state heartbeat cycles
+    for _ in range(5):
+        # Heartbeat packet arrives
+        discovery.handle_peer_message(peer_msg, WF_ETHERNET_PEER_IP)
+        # Even if an alternate packet arrives from Wi-Fi for same instance, no flap
+        discovery.handle_peer_message(peer_msg, WF_WIFI_PEER_IP)
+        controller.reconcile()
+
+        # Child PID must remain strictly the same
+        assert controller._speaker_child_pid == initial_pid
+        status = controller.get_status()
+        assert status.speaker_path_state == PathState.RUNNING.value
+        assert status.peer_address == WF_ETHERNET_PEER_IP
+        assert status.local_bind_address == WF_ETHERNET_LOCAL_IP
+
+    # on_peer_discovered must NOT be invoked repeatedly on routine heartbeats
+    assert len(discovered_callbacks) == 1
+    # Only 1 process ever started
+    assert len(runner.started_commands) == 1
+    controller.shutdown()
+
+
+def test_heartbeat_cessation_still_expires_and_cleans_up(monkeypatch, temp_state_file):
+    """Test 3: Heartbeat cessation > 15s causes peer expiry and controller cleans up child processes."""
+    time_mock = MockTimeProvider(2000.0)
+    monkeypatch.setattr(time, "time", time_mock.time)
+
+    resolver = DictRouteResolver(WF_ROUTES)
+    classifier = FakeClassifier(WF_MEDIUM_MAP)
+    discovery = PeerDiscoveryService(
+        local_role=HostRole.WINDOWS,
+        instance_id="win-ctrl-cessation",
+        control_port=50355,
+        route_resolver=resolver,
+        interface_classifier=classifier,
+        election_delay=0.0,
+        heartbeat_interval=4.0,
+    )
+    runner = FakeProcessRunner()
+    builder = FakePipelineBuilder()
+    controller = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=builder,
+        discovery_service=discovery,
+        lock_port=50356,
+        ipc_port=50357,
+    )
+    discovery.on_peer_discovered = controller._on_peer_discovered
+    assert controller.start() is True
+
+    peer_msg = {
+        "version": 1,
+        "role": "macos",
+        "instance_id": "mac-peer-cessation",
+        "speaker_port": 5004,
+    }
+    # Initial arrival
+    discovery.handle_peer_message(peer_msg, WF_ETHERNET_PEER_IP)
+    controller.reconcile()
+    spk_pid = controller._speaker_child_pid
+    assert spk_pid is not None
+    assert controller.get_status().speaker_path_state == PathState.RUNNING.value
+
+    # Heartbeats arrive for 10 seconds (healthy)
+    for _ in range(10):
+        time_mock.advance(1.0)
+        discovery.refresh_peer_state()
+        discovery.handle_peer_message(peer_msg, WF_ETHERNET_PEER_IP)
+        controller.reconcile()
+        assert controller.get_status().peer_available is True
+        assert controller._speaker_child_pid == spk_pid
+
+    # Heartbeats CEASE: advance time by 16 seconds without new messages
+    for _ in range(16):
+        time_mock.advance(1.0)
+        discovery.refresh_peer_state()
+        controller.reconcile()
+
+    # Must expire and enter DISCOVERING, with child killed
+    status = controller.get_status()
+    assert status.peer_available is False
+    assert status.controller_state == LifecycleState.DISCOVERING.value
+    assert spk_pid in runner.stopped_pids
+    assert controller._speaker_child_pid is None
+    assert "mac-peer-cessation" not in discovery._known_responders
+    controller.shutdown()
+
 
 
 

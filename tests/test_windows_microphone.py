@@ -429,6 +429,7 @@ def test_active_microphone_stops_when_peer_becomes_unavailable(temp_state_file):
     assert ctrl.get_status().owned_children_count == 0
     assert ctrl.get_status().microphone_path_state == PathState.READY.value
     assert ctrl.get_status().speaker_path_state == PathState.IDLE.value
+    ctrl.shutdown()
 
 
 def test_active_microphone_stops_when_peer_becomes_ambiguous(temp_state_file):
@@ -463,6 +464,7 @@ def test_active_microphone_stops_when_peer_becomes_ambiguous(temp_state_file):
     assert ctrl.get_status().owned_children_count == 0
     assert ctrl.get_status().microphone_path_state == PathState.READY.value
     assert ctrl.get_status().speaker_path_state == PathState.IDLE.value
+    ctrl.shutdown()
 
 
 def test_speaker_endpoint_failure_does_not_prevent_requested_microphone_path(temp_state_file):
@@ -498,3 +500,4 @@ def test_speaker_endpoint_failure_does_not_prevent_requested_microphone_path(tem
     assert status.owned_children_count == 1
     assert len(runner.started_commands) == 1
     assert "wasapisink" in runner.started_commands[0]
+    ctrl.shutdown()

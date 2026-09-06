@@ -37,6 +37,9 @@ from bridge_core.contract import (
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_HEARTBEAT_INTERVAL = 4.0
+
+
 class InterfaceMedium(str, enum.Enum):
     """Network interface medium classification."""
 
@@ -269,6 +272,7 @@ class PeerDiscoveryService:
         on_peer_discovered: Optional[Callable[[str, str, int, str], None]] = None,
         on_peer_lost: Optional[Callable[[], None]] = None,
         election_delay: float = 0.25,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     ):
         self.local_role = local_role
         self.target_role = (
@@ -278,6 +282,7 @@ class PeerDiscoveryService:
         self.control_port = control_port
         self.speaker_port = speaker_port
         self.election_delay = election_delay
+        self.heartbeat_interval = heartbeat_interval
         self.enumerator = interface_enumerator or InterfaceEnumerator()
         self.route_resolver = route_resolver or RouteResolver()
         self.classifier = interface_classifier or InterfaceClassifier()
@@ -293,6 +298,7 @@ class PeerDiscoveryService:
         self._peer_speaker_port: int = speaker_port
         self._peer_instance_id: Optional[str] = None
         self._last_peer_seen: float = 0.0
+        self._last_heartbeat_sent: float = 0.0
         self._last_enumeration_error: Optional[str] = None
 
         # Ambiguity tracking: map of peer_instance_id -> (peer_ip, last_seen)
@@ -386,6 +392,11 @@ class PeerDiscoveryService:
                     self._local_bind_address = None
                     self._last_peer_seen = 0.0
 
+            # 3. Steady-state control heartbeat: broadcast HELLO if due
+            if self._running and (current_time - self._last_heartbeat_sent) >= self.heartbeat_interval:
+                self.broadcast_hello()
+                self._last_heartbeat_sent = current_time
+
     def _elect_best_route(self, peer_inst: str) -> Optional[Tuple[str, str, float]]:
         """Edicts the best route for peer_inst based on medium priority:
         WIRED_ETHERNET > WIFI > OTHER.
@@ -428,6 +439,7 @@ class PeerDiscoveryService:
                 raise
 
             self._running = True
+            self._last_heartbeat_sent = 0.0
             self._recv_thread = threading.Thread(
                 target=self._listen_loop, daemon=True, name="PeerDiscoveryRecv"
             )
