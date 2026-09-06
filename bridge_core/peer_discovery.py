@@ -18,7 +18,9 @@ import enum
 import ipaddress
 import json
 import logging
+import os
 import platform
+import shutil
 import socket
 import subprocess
 import threading
@@ -51,6 +53,23 @@ class InterfaceMedium(str, enum.Enum):
 class InterfaceClassifier:
     """Seam for classifying local IP addresses by underlying network medium."""
 
+    def __init__(self) -> None:
+        self._positive_cache: Dict[str, InterfaceMedium] = {}
+
+    def _resolve_powershell_cmd(self) -> Optional[str]:
+        """Resolves PowerShell executable via SystemRoot, pwsh, or PATH."""
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        built_in = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if os.path.isfile(built_in):
+            return built_in
+        pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+        if pwsh:
+            return pwsh
+        ps = shutil.which("powershell.exe") or shutil.which("powershell")
+        if ps:
+            return ps
+        return None
+
     def classify_interface(self, ip_str: str) -> InterfaceMedium:
         """Classifies the interface owning ip_str into InterfaceMedium.
         
@@ -60,31 +79,38 @@ class InterfaceClassifier:
         if not ip_str or ip_str in ("0.0.0.0", "127.0.0.1"):
             return InterfaceMedium.OTHER
 
+        cached = self._positive_cache.get(ip_str)
+        if cached is not None:
+            return cached
+
+        classified = InterfaceMedium.OTHER
         try:
-            import psutil
-            # Find the interface name associated with this IP
-            target_iface = None
-            for iface_name, addrs in psutil.net_if_addrs().items():
-                for addr in addrs:
-                    if addr.family == socket.AF_INET and addr.address == ip_str:
-                        target_iface = iface_name
-                        break
-                if target_iface:
-                    break
-
-            if not target_iface:
-                return InterfaceMedium.OTHER
-
-            # Platform-specific OS metadata classification
             sys_name = platform.system()
-            if sys_name == "Darwin":
-                return self._classify_darwin(target_iface)
-            elif sys_name == "Windows":
-                return self._classify_windows(target_iface)
+            if sys_name == "Windows":
+                classified = self._classify_windows(ip_str)
+            elif sys_name == "Darwin":
+                import psutil
+                target_iface = None
+                for iface_name, addrs in psutil.net_if_addrs().items():
+                    for addr in addrs:
+                        if addr.family == socket.AF_INET and addr.address == ip_str:
+                            target_iface = iface_name
+                            break
+                    if target_iface:
+                        break
+
+                if target_iface:
+                    classified = self._classify_darwin(target_iface)
+            else:
+                classified = InterfaceMedium.OTHER
         except Exception as exc:
             logger.debug("Interface classification failed for %s: %s", ip_str, exc)
+            classified = InterfaceMedium.OTHER
 
-        return InterfaceMedium.OTHER
+        if classified in (InterfaceMedium.WIRED_ETHERNET, InterfaceMedium.WIFI):
+            self._positive_cache[ip_str] = classified
+
+        return classified
 
     def _classify_darwin(self, iface_name: str) -> InterfaceMedium:
         """Classifies macOS interface using system_profiler SPNetworkDataType and networksetup."""
@@ -133,17 +159,21 @@ class InterfaceClassifier:
 
         return InterfaceMedium.OTHER
 
-    def _classify_windows(self, iface_name: str) -> InterfaceMedium:
-        """Classifies Windows interface using PowerShell Get-NetAdapter PhysicalMediaType."""
+    def _classify_windows(self, ip_str: str) -> InterfaceMedium:
+        """Classifies Windows interface using PowerShell Get-NetAdapter PhysicalMediaType by IP."""
         try:
+            ps_exe = self._resolve_powershell_cmd()
+            if not ps_exe:
+                return InterfaceMedium.OTHER
+
             cmd = [
-                "powershell.exe",
+                ps_exe,
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                f"Get-NetAdapter -Name '{iface_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PhysicalMediaType",
+                f"(Get-NetAdapter -InterfaceIndex (Get-NetIPAddress -IPAddress {ip_str} -ErrorAction SilentlyContinue).InterfaceIndex -ErrorAction SilentlyContinue).PhysicalMediaType",
             ]
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3.0).strip()
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=8.0).strip()
             out_lower = out.lower()
             if "802.3" in out_lower or "ethernet" in out_lower:
                 return InterfaceMedium.WIRED_ETHERNET
