@@ -14,13 +14,16 @@ and multiple-responder ambiguity detection:
 - Automatically recovers when secondary responders expire.
 """
 
+import enum
 import ipaddress
 import json
 import logging
+import platform
 import socket
+import subprocess
 import threading
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from bridge_core.contract import (
     CONTROL_PROTOCOL_VERSION,
@@ -32,6 +35,121 @@ from bridge_core.contract import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class InterfaceMedium(str, enum.Enum):
+    """Network interface medium classification."""
+
+    WIRED_ETHERNET = "WIRED_ETHERNET"
+    WIFI = "WIFI"
+    OTHER = "OTHER"
+
+
+class InterfaceClassifier:
+    """Seam for classifying local IP addresses by underlying network medium."""
+
+    def classify_interface(self, ip_str: str) -> InterfaceMedium:
+        """Classifies the interface owning ip_str into InterfaceMedium.
+        
+        Uses Darwin (system_profiler / networksetup) or Windows (PowerShell Get-NetAdapter) OS metadata.
+        Falls back safely to InterfaceMedium.OTHER if not explicitly confirmed as Ethernet or Wi-Fi.
+        """
+        if not ip_str or ip_str in ("0.0.0.0", "127.0.0.1"):
+            return InterfaceMedium.OTHER
+
+        try:
+            import psutil
+            # Find the interface name associated with this IP
+            target_iface = None
+            for iface_name, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    if addr.family == socket.AF_INET and addr.address == ip_str:
+                        target_iface = iface_name
+                        break
+                if target_iface:
+                    break
+
+            if not target_iface:
+                return InterfaceMedium.OTHER
+
+            # Platform-specific OS metadata classification
+            sys_name = platform.system()
+            if sys_name == "Darwin":
+                return self._classify_darwin(target_iface)
+            elif sys_name == "Windows":
+                return self._classify_windows(target_iface)
+        except Exception as exc:
+            logger.debug("Interface classification failed for %s: %s", ip_str, exc)
+
+        return InterfaceMedium.OTHER
+
+    def _classify_darwin(self, iface_name: str) -> InterfaceMedium:
+        """Classifies macOS interface using system_profiler SPNetworkDataType and networksetup."""
+        try:
+            # 1. Primary: system_profiler SPNetworkDataType exposes authoritative BSD Device Name -> Type
+            cmd = ["system_profiler", "SPNetworkDataType"]
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3.0)
+            current_type = ""
+            current_dev = ""
+            for line in out.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Type:"):
+                    current_type = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("BSD Device Name:"):
+                    current_dev = stripped.split(":", 1)[1].strip()
+                    if current_dev == iface_name:
+                        type_lower = current_type.lower()
+                        if "ethernet" in type_lower:
+                            return InterfaceMedium.WIRED_ETHERNET
+                        if "airport" in type_lower or "wi-fi" in type_lower or "wireless" in type_lower:
+                            return InterfaceMedium.WIFI
+                        return InterfaceMedium.OTHER
+        except Exception:
+            pass
+
+        try:
+            # 2. Secondary fallback: networksetup -listallhardwareports
+            cmd = ["networksetup", "-listallhardwareports"]
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=2.0)
+            current_port = ""
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("Hardware Port:"):
+                    current_port = line.split(":", 1)[1].strip()
+                elif line.startswith("Device:"):
+                    dev = line.split(":", 1)[1].strip()
+                    if dev == iface_name:
+                        port_lower = current_port.lower()
+                        if "wi-fi" in port_lower or "airport" in port_lower:
+                            return InterfaceMedium.WIFI
+                        if "ethernet" in port_lower or "lan" in port_lower or "thunderbolt bridge" in port_lower:
+                            return InterfaceMedium.WIRED_ETHERNET
+                        return InterfaceMedium.OTHER
+        except Exception:
+            pass
+
+        return InterfaceMedium.OTHER
+
+    def _classify_windows(self, iface_name: str) -> InterfaceMedium:
+        """Classifies Windows interface using PowerShell Get-NetAdapter PhysicalMediaType."""
+        try:
+            cmd = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"Get-NetAdapter -Name '{iface_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PhysicalMediaType",
+            ]
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3.0).strip()
+            out_lower = out.lower()
+            if "802.3" in out_lower or "ethernet" in out_lower:
+                return InterfaceMedium.WIRED_ETHERNET
+            if "native 802.11" in out_lower or "wireless" in out_lower or "wi-fi" in out_lower:
+                return InterfaceMedium.WIFI
+        except Exception:
+            pass
+        return InterfaceMedium.OTHER
+
 
 
 def is_eligible_onlink_ipv4(ip_str: str, netmask_str: Optional[str] = None) -> bool:
@@ -147,8 +265,10 @@ class PeerDiscoveryService:
         speaker_port: int = DEFAULT_SPEAKER_RTP_PORT,
         interface_enumerator: Optional[InterfaceEnumerator] = None,
         route_resolver: Optional[RouteResolver] = None,
+        interface_classifier: Optional[InterfaceClassifier] = None,
         on_peer_discovered: Optional[Callable[[str, str, int, str], None]] = None,
         on_peer_lost: Optional[Callable[[], None]] = None,
+        election_delay: float = 0.25,
     ):
         self.local_role = local_role
         self.target_role = (
@@ -157,8 +277,10 @@ class PeerDiscoveryService:
         self.instance_id = instance_id
         self.control_port = control_port
         self.speaker_port = speaker_port
+        self.election_delay = election_delay
         self.enumerator = interface_enumerator or InterfaceEnumerator()
         self.route_resolver = route_resolver or RouteResolver()
+        self.classifier = interface_classifier or InterfaceClassifier()
         self.on_peer_discovered = on_peer_discovered
         self.on_peer_lost = on_peer_lost
 
@@ -175,13 +297,17 @@ class PeerDiscoveryService:
 
         # Ambiguity tracking: map of peer_instance_id -> (peer_ip, last_seen)
         self._known_responders: dict[str, Tuple[str, float]] = {}
+        # Multi-interface route candidates: peer_instance_id -> {peer_ip: (local_source_ip, last_seen, medium)}
+        self._peer_candidates: dict[str, dict[str, Tuple[str, float, InterfaceMedium]]] = {}
         self._is_ambiguous = False
+        self._settle_timer: Optional[threading.Timer] = None
+        self._is_settling: bool = False
         self._lock = threading.RLock()
 
     @property
     def peer_available(self) -> bool:
         with self._lock:
-            if self._is_ambiguous or not self._peer_address:
+            if self._is_ambiguous or not self._peer_address or self._is_settling:
                 return False
             return (time.time() - self._last_peer_seen) < 15.0
 
@@ -225,6 +351,15 @@ class PeerDiscoveryService:
             self._known_responders = {
                 k: v for k, v in self._known_responders.items() if (current_time - v[1]) < 15.0
             }
+            # Prune peer route candidates expired > 15s
+            for inst in list(self._peer_candidates.keys()):
+                self._peer_candidates[inst] = {
+                    pip: data
+                    for pip, data in self._peer_candidates[inst].items()
+                    if (current_time - data[1]) < 15.0
+                }
+                if not self._peer_candidates[inst]:
+                    del self._peer_candidates[inst]
 
             # 2. Ambiguity recovery or transition
             if self._is_ambiguous:
@@ -233,9 +368,11 @@ class PeerDiscoveryService:
                     if len(self._known_responders) == 1:
                         sole_inst, (sole_ip, sole_time) = next(iter(self._known_responders.items()))
                         self._peer_instance_id = sole_inst
-                        self._peer_address = sole_ip
-                        self._local_bind_address = self.route_resolver.resolve_local_route(sole_ip, self.control_port)
-                        self._last_peer_seen = sole_time
+                        best_route = self._elect_best_route(sole_inst)
+                        target_ip = best_route[0] if best_route else sole_ip
+                        self._peer_address = target_ip
+                        self._local_bind_address = self.route_resolver.resolve_local_route(target_ip, self.control_port)
+                        self._last_peer_seen = best_route[2] if best_route else sole_time
                     else:
                         self._peer_instance_id = None
                         self._peer_address = None
@@ -248,6 +385,31 @@ class PeerDiscoveryService:
                     self._peer_address = None
                     self._local_bind_address = None
                     self._last_peer_seen = 0.0
+
+    def _elect_best_route(self, peer_inst: str) -> Optional[Tuple[str, str, float]]:
+        """Edicts the best route for peer_inst based on medium priority:
+        WIRED_ETHERNET > WIFI > OTHER.
+        
+        Returns (peer_ip, local_bind_ip, last_seen) or None.
+        """
+        candidates = self._peer_candidates.get(peer_inst, {})
+        if not candidates:
+            return None
+
+        def medium_priority(medium: InterfaceMedium) -> int:
+            if medium == InterfaceMedium.WIRED_ETHERNET:
+                return 0
+            if medium == InterfaceMedium.WIFI:
+                return 1
+            return 2
+
+        # Sort by medium priority ascending, then by most recently seen descending
+        sorted_candidates = sorted(
+            candidates.items(),
+            key=lambda item: (medium_priority(item[1][2]), -item[1][1]),
+        )
+        best_ip, (local_ip, last_seen, _medium) = sorted_candidates[0]
+        return best_ip, local_ip, last_seen
 
     def start(self) -> None:
         with self._lock:
@@ -274,6 +436,14 @@ class PeerDiscoveryService:
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            if self._settle_timer:
+                try:
+                    self._settle_timer.cancel()
+                except Exception:
+                    pass
+                self._settle_timer = None
+            self._is_settling = False
+
             if self._listener_sock:
                 try:
                     self._listener_sock.close()
@@ -337,12 +507,34 @@ class PeerDiscoveryService:
         peer_spk_port = msg.get("speaker_port", DEFAULT_SPEAKER_RTP_PORT)
 
         now = time.time()
+        # Resolve local route to peer
+        local_source_ip = self.route_resolver.resolve_local_route(peer_ip, self.control_port)
+        try:
+            route_medium = self.classifier.classify_interface(local_source_ip)
+        except Exception:
+            route_medium = InterfaceMedium.OTHER
+
         with self._lock:
             # Prune responders expired > 15s
             self._known_responders = {
                 k: v for k, v in self._known_responders.items() if (now - v[1]) < 15.0
             }
             self._known_responders[peer_inst] = (peer_ip, now)
+
+            # Record candidate route under peer_inst
+            if peer_inst not in self._peer_candidates:
+                self._peer_candidates[peer_inst] = {}
+            self._peer_candidates[peer_inst][peer_ip] = (local_source_ip, now, route_medium)
+
+            # Prune peer_candidates
+            for inst in list(self._peer_candidates.keys()):
+                self._peer_candidates[inst] = {
+                    pip: data
+                    for pip, data in self._peer_candidates[inst].items()
+                    if (now - data[1]) < 15.0
+                }
+                if not self._peer_candidates[inst]:
+                    del self._peer_candidates[inst]
 
             if len(self._known_responders) > 1:
                 logger.warning(
@@ -352,12 +544,16 @@ class PeerDiscoveryService:
                 self._is_ambiguous = True
                 self._peer_address = None
                 self._local_bind_address = None
+                if self._settle_timer:
+                    try:
+                        self._settle_timer.cancel()
+                    except Exception:
+                        pass
+                    self._settle_timer = None
+                self._is_settling = False
                 return
 
             self._is_ambiguous = False
-
-        # Resolve local route to peer
-        local_source_ip = self.route_resolver.resolve_local_route(peer_ip, self.control_port)
 
         # Reply with ACK if this was a HELLO and listener socket is open
         if "peer_instance_id" not in msg and self._listener_sock:
@@ -380,21 +576,107 @@ class PeerDiscoveryService:
                 (now - self._last_peer_seen) < 15.0
                 and self._peer_address is not None
                 and not self._is_ambiguous
+                and not self._is_settling
             )
-            # If we are already stably paired with this instance on an active route, keep the active route
-            if was_avail and self._peer_instance_id == peer_inst and self._peer_address != peer_ip:
-                # Update timestamp for liveness on current route, but do not flap IP
-                self._last_peer_seen = now
-                self._peer_speaker_port = peer_spk_port
+
+            # Route election:
+            # 1. If currently paired on an active route, check if an upgrade to WIRED_ETHERNET is available
+            #    (e.g., initial Wi-Fi packet arrived first, and now Ethernet arrives for the first time).
+            # 2. If already on WIRED_ETHERNET, never drift when a Wi-Fi packet arrives.
+            # 3. If not yet active or route has expired, elect the highest priority candidate (wired > wifi > other).
+            current_medium = InterfaceMedium.OTHER
+            if self._local_bind_address:
+                try:
+                    current_medium = self.classifier.classify_interface(self._local_bind_address)
+                except Exception:
+                    current_medium = InterfaceMedium.OTHER
+
+            notify_peer_discovered = False
+            notify_args: Optional[Tuple[str, str, int, str]] = None
+
+            if was_avail and self._peer_instance_id == peer_inst:
+                # Stable route preservation:
+                # If current route is already WIRED_ETHERNET (or equal priority), do NOT flap/drift
+                if current_medium == InterfaceMedium.WIRED_ETHERNET or route_medium != InterfaceMedium.WIRED_ETHERNET:
+                    # Update liveness timestamp, but preserve selected route
+                    self._last_peer_seen = now
+                    self._peer_speaker_port = peer_spk_port
+                else:
+                    # Upgrade path: current route was WIFI/OTHER, but a WIRED_ETHERNET packet just arrived
+                    self._peer_address = peer_ip
+                    self._local_bind_address = local_source_ip
+                    self._peer_speaker_port = peer_spk_port
+                    self._last_peer_seen = now
+                    if self._settle_timer:
+                        try:
+                            self._settle_timer.cancel()
+                        except Exception:
+                            pass
+                        self._settle_timer = None
+                    self._is_settling = False
+                    notify_peer_discovered = True
+                    notify_args = (self._peer_address, self._local_bind_address, peer_spk_port, peer_inst)
             else:
-                self._peer_address = peer_ip
-                self._local_bind_address = local_source_ip
+                # Brand new peer or peer previously expired/settling
+                best_route = self._elect_best_route(peer_inst)
+                if best_route:
+                    best_ip, best_local, best_seen = best_route
+                else:
+                    best_ip, best_local, best_seen = peer_ip, local_source_ip, now
+
+                try:
+                    best_medium = self.classifier.classify_interface(best_local)
+                except Exception:
+                    best_medium = InterfaceMedium.OTHER
+
                 self._peer_instance_id = peer_inst
                 self._peer_speaker_port = peer_spk_port
-                self._last_peer_seen = now
+                self._peer_address = best_ip
+                self._local_bind_address = best_local
+                self._last_peer_seen = best_seen
 
-        if not was_avail and self.on_peer_discovered:
-            self.on_peer_discovered(peer_ip, local_source_ip, peer_spk_port, peer_inst)
+                if best_medium == InterfaceMedium.WIRED_ETHERNET or self.election_delay <= 0.0:
+                    # Wired Ethernet available immediately or settling disabled: commit route directly
+                    if self._settle_timer:
+                        try:
+                            self._settle_timer.cancel()
+                        except Exception:
+                            pass
+                        self._settle_timer = None
+                    self._is_settling = False
+                    notify_peer_discovered = True
+                    notify_args = (self._peer_address, self._local_bind_address, peer_spk_port, peer_inst)
+                else:
+                    # Non-wired candidate (WIFI or OTHER): start or maintain election window
+                    # Delay committing to allow potential Ethernet packet to arrive first.
+                    self._is_settling = True
+                    if self._settle_timer is None:
+                        def _on_settle_timeout():
+                            cb = None
+                            args = None
+                            with self._lock:
+                                self._settle_timer = None
+                                if not self._running or self._is_ambiguous or not self._peer_address:
+                                    self._is_settling = False
+                                    return
+                                self._is_settling = False
+                                cb = self.on_peer_discovered
+                                args = (
+                                    self._peer_address,
+                                    self._local_bind_address,
+                                    self._peer_speaker_port,
+                                    self._peer_instance_id,
+                                )
+                            if cb and args:
+                                cb(*args)
+
+                        self._settle_timer = threading.Timer(self.election_delay, _on_settle_timeout)
+                        self._settle_timer.daemon = True
+                        self._settle_timer.start()
+
+        if notify_peer_discovered and self.on_peer_discovered and notify_args:
+            self.on_peer_discovered(*notify_args)
+
 
     def _listen_loop(self) -> None:
         while self._running and self._listener_sock:
