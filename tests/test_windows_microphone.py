@@ -143,7 +143,8 @@ def test_microphone_receiver_builder_canonical_command():
     assert "rtpjitterbuffer" in cmd
     assert "latency=80" in cmd
     assert "rtpL16depay" in cmd
-    assert "wasapisink" in cmd
+    assert "wasapi2sink" in cmd
+    assert "wasapisink" not in cmd
     assert "low-latency=true" in cmd
     assert "sync=false" in cmd
     assert "device={0.0.0.00000000}.{PACK43_INPUT}" in cmd
@@ -499,5 +500,6 @@ def test_speaker_endpoint_failure_does_not_prevent_requested_microphone_path(tem
     assert status.speaker_path_state == PathState.FAILED.value
     assert status.owned_children_count == 1
     assert len(runner.started_commands) == 1
-    assert "wasapisink" in runner.started_commands[0]
+    assert "wasapi2sink" in runner.started_commands[0]
+    assert "wasapisink" not in runner.started_commands[0]
     ctrl.shutdown()

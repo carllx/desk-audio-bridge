@@ -8,7 +8,7 @@ gst-launch-1.0 -m \
   ! rtpL16depay \
   ! audioconvert \
   ! audioresample \
-  ! wasapisink low-latency=true sync=false [device=<PACK43_RENDER_DEVICE_ID>]
+  ! wasapi2sink low-latency=true sync=false [device=<PACK43_RENDER_DEVICE_ID>]
 """
 
 import os
@@ -79,7 +79,7 @@ class MicrophoneReceiverBuilder:
             "!",
             "audioresample",
             "!",
-            "wasapisink",
+            "wasapi2sink",
             "low-latency=true",
             "sync=false",
         ])
